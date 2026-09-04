@@ -1,5 +1,5 @@
 # ============================================================
-# PXpanel 12.1.0 Beta
+# PXPanel 13.6.1
 # Railway Ready
 # ============================================================
 
@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import secrets
+import string
 import time
 
 from collections import defaultdict, deque
@@ -40,8 +41,8 @@ from fastapi.middleware.cors import CORSMiddleware
 # APP
 # ============================================================
 
-APP_NAME = "PXpanel"
-APP_VERSION = "12.1.0 Beta"
+APP_NAME = "PXPanel"
+APP_VERSION = "13.6.1"
 
 SUPPORT_USERNAME = "@logic_sec"
 SUPPORT_URL = "https://t.me/logic_sec"
@@ -93,8 +94,8 @@ DATA_DIR.mkdir(
     exist_ok=True,
 )
 
-DATA_FILE = DATA_DIR / "pxpanel_state.json"
-SECRET_FILE = DATA_DIR / "pxpanel_secret.key"
+DATA_FILE = DATA_DIR / "pixonpanel_state.json"
+SECRET_FILE = DATA_DIR / "pixonpanel_secret.key"
 
 
 # ============================================================
@@ -193,6 +194,7 @@ LINKS: dict = {}
 SUBS: dict = {}
 SESSIONS: dict = {}
 connections: dict = {}
+CATEGORIES: dict = {}
 
 stats = {
     "total_bytes": 0,
@@ -218,7 +220,39 @@ PROTOCOLS = (
     "xhttp-packet-up",
     "xhttp-stream-up",
     "xhttp-stream-one",
+    "vmess-ws",
+    "trojan-ws",
+    "shadowsocks",
+    "socks5",
+    "http",
+    "hysteria2",
+    "tuic",
+    "wireguard",
+    "highspeed-demo",
+    "gaming-lite-demo",
 )
+
+PROTOCOL_LABELS = {
+    "vless-ws": "VLESS WebSocket",
+    "xhttp-packet-up": "XHTTP Packet Up",
+    "xhttp-stream-up": "XHTTP Stream Up",
+    "xhttp-stream-one": "XHTTP Stream One",
+    "vmess-ws": "VMess WebSocket",
+    "trojan-ws": "Trojan WebSocket",
+    "shadowsocks": "Shadowsocks",
+    "socks5": "SOCKS5",
+    "http": "HTTP Proxy",
+    "hysteria2": "Hysteria 2",
+    "tuic": "TUIC",
+    "wireguard": "WireGuard",
+    "highspeed-demo": "HighSpeed Upload/Download (دمو)",
+    "gaming-lite-demo": "Gaming Lite (دمو)",
+}
+
+PROTOCOL_ALIASES = {
+    "vmess": "vmess-ws", "trojan": "trojan-ws", "ss": "shadowsocks",
+    "socks": "socks5", "hy2": "hysteria2", "hysteria": "hysteria2",
+}
 
 DEFAULT_PROTOCOL = "vless-ws"
 
@@ -249,6 +283,12 @@ MIN_PORT = 1
 MAX_PORT = 65535
 
 DEFAULT_SPEED_LIMIT = 0
+
+
+def normalize_protocol(protocol: str | None) -> str:
+    value = str(protocol or DEFAULT_PROTOCOL).strip().lower()
+    value = PROTOCOL_ALIASES.get(value, value)
+    return value if value in PROTOCOLS else DEFAULT_PROTOCOL
 
 
 # ============================================================
@@ -337,18 +377,26 @@ def generate_uuid():
     )
 
 
+def random_config_name(existing=None):
+    existing = existing or set()
+    alphabet = string.ascii_lowercase + string.digits
+    for _ in range(80):
+        length = secrets.randbelow(6) + 8
+        name = "".join(secrets.choice(alphabet) for _ in range(length))
+        if name not in existing and name and not name[0].isdigit():
+            return name
+    return secrets.token_hex(6)
+
+def sanitize_config_name(name: str) -> str:
+    if not name:
+        return random_config_name()
+    cleaned = "".join(ch for ch in str(name) if ch.isascii() and ch.isalnum())
+    if not cleaned or cleaned[0].isdigit():
+        cleaned = ("a" + cleaned) if cleaned else random_config_name()
+    return cleaned[:40]
+
 def auto_config_name() -> str:
-    alphabet = (
-        "abcdefghijklmnopqrstuvwxyz"
-        "0123456789"
-    )
-
-    suffix = "".join(
-        secrets.choice(alphabet)
-        for _ in range(8)
-    )
-
-    return f"pxpanel_{suffix}"
+    return random_config_name()
 
 
 def now_ir():
@@ -745,7 +793,7 @@ def clear_login_failures(ip: str):
 # SESSION
 # ============================================================
 
-SESSION_COOKIE = "pxpanel_session"
+SESSION_COOKIE = "pixonpanel_session"
 
 SESSION_TTL = (
     60
@@ -860,108 +908,43 @@ def set_auth_cookie(
 # ============================================================
 
 def generate_vless_link(
-    uuid: str,
-    host: str,
-    remark: str = "PXpanel",
-    protocol: str = DEFAULT_PROTOCOL,
-    fingerprint: str | None = None,
-    alpn: str | None = None,
-    port: int | None = None,
+    uuid: str, host: str, remark: str = "PXPanel",
+    protocol: str = DEFAULT_PROTOCOL, fingerprint: str | None = None,
+    alpn: str | None = None, port: int | None = None,
 ):
-
-    fp = (
-        fingerprint
-        or DEFAULT_FINGERPRINT
-    ).strip().lower()
-
-    if fp not in FINGERPRINTS:
-        fp = DEFAULT_FINGERPRINT
-
-    alpn_value = (
-        (
-            alpn
-            or ""
-        ).strip()
-        or DEFAULT_ALPN_BY_PROTOCOL.get(
-            protocol,
-            "http/1.1",
-        )
-    )
-
-    port_value = (
-        port
-        or DEFAULT_PORT
-    )
-
-    if not (
-        MIN_PORT
-        <= port_value
-        <= MAX_PORT
-    ):
-        port_value = DEFAULT_PORT
-
-    # ========================================================
-    # IMPORTANT:
-    # The working VLESS WebSocket core stays unchanged.
-    # ========================================================
-
+    protocol = normalize_protocol(protocol)
+    fp = (fingerprint or DEFAULT_FINGERPRINT).strip().lower()
+    if fp not in FINGERPRINTS: fp = DEFAULT_FINGERPRINT
+    port_value = safe_int(port, DEFAULT_PORT, MIN_PORT, MAX_PORT)
+    alpn_value = (alpn or DEFAULT_ALPN_BY_PROTOCOL.get(protocol, "http/1.1")).strip()
+    label = quote(str(remark or "PXPanel"), safe="")
     if protocol == "vless-ws":
-
-        path = (
-            f"/ws/{uuid}"
-        )
-
-        params = {
-            "encryption": "none",
-            "security": "tls",
-            "type": "ws",
-            "host": host,
-            "path": path,
-            "sni": host,
-            "fp": fp,
-            "alpn": alpn_value,
-        }
-
-    else:
-
-        mode = protocol.replace(
-            "xhttp-",
-            "",
-        )
-
-        path = (
-            f"/xhttp-siz10/"
-            f"{mode}/"
-            f"{uuid}"
-        )
-
-        params = {
-            "encryption": "none",
-            "security": "tls",
-            "type": "xhttp",
-            "mode": mode,
-            "host": host,
-            "path": path,
-            "sni": host,
-            "fp": fp,
-            "alpn": alpn_value,
-        }
-
-    query = "&".join(
-        f"{key}="
-        f"{quote(str(value))}"
-        for key, value in params.items()
-    )
-
-    return (
-        f"vless://"
-        f"{uuid}@"
-        f"{host}:"
-        f"{port_value}?"
-        f"{query}#"
-        f"{quote(remark)}"
-    )
-
+        q = {"encryption":"none","security":"tls","type":"ws","host":host,"path":f"/ws/{uuid}","sni":host,"fp":fp,"alpn":alpn_value}
+        return "vless://" + uuid + "@" + host + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/') }" for k,v in q.items()) + "#" + label
+    if protocol.startswith("xhttp-"):
+        mode = protocol.replace("xhttp-", "")
+        q = {"encryption":"none","security":"tls","type":"xhttp","mode":mode,"host":host,"path":f"/xhttp-siz10/{mode}/{uuid}","sni":host,"fp":fp,"alpn":alpn_value}
+        return "vless://" + uuid + "@" + host + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/') }" for k,v in q.items()) + "#" + label
+    if protocol == "vmess-ws":
+        raw = {"v":"2","ps":remark,"add":host,"port":port_value,"id":uuid,"aid":0,"scy":"auto","net":"ws","type":"none","host":host,"path":f"/ws/{uuid}","tls":"tls","sni":host,"fp":fp}
+        return "vmess://" + base64.b64encode(json.dumps(raw,separators=(",",":"),ensure_ascii=False).encode()).decode()
+    if protocol == "trojan-ws":
+        return f"trojan://{uuid}@{host}:{port_value}?security=tls&type=ws&host={quote(host)}&path={quote('/ws/'+uuid)}&sni={quote(host)}#{label}"
+    if protocol == "shadowsocks":
+        method = os.getenv("SS_METHOD", "aes-256-gcm")
+        userinfo = base64.urlsafe_b64encode(f"{method}:{uuid}".encode()).decode().rstrip("=")
+        return f"ss://{userinfo}@{host}:{port_value}#{label}"
+    if protocol == "socks5": return f"socks5://{uuid}:{uuid}@{host}:{port_value}#{label}"
+    if protocol == "http": return f"http://{uuid}:{uuid}@{host}:{port_value}#{label}"
+    if protocol == "hysteria2": return f"hysteria2://{uuid}@{host}:{port_value}/?sni={quote(host)}&insecure=0#{label}"
+    if protocol == "tuic": return f"tuic://{uuid}:{uuid}@{host}:{port_value}?sni={quote(host)}&alpn=h3#{label}"
+    if protocol == "wireguard": return f"wireguard://{uuid}@{host}:{port_value}?publicKey={uuid}#{label}"
+    if protocol == "highspeed-demo":
+        q = {"encryption":"none","security":"tls","type":"xhttp","mode":"stream-up","host":host,"path":f"/xhttp-siz10/stream-up/{uuid}","sni":host,"fp":fp,"alpn":"h2,http/1.1"}
+        return "vless://" + uuid + "@" + host + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/')}" for k,v in q.items()) + "#" + label
+    if protocol == "gaming-lite-demo":
+        return f"hysteria2://{uuid}@{host}:{port_value}/?sni={quote(host)}&insecure=0&obfs=salamander#{label}"
+    return f"vless://{uuid}@{host}:{port_value}"
 
 def vless_link_for_link(
     link: dict,
@@ -971,10 +954,7 @@ def vless_link_for_link(
     return generate_vless_link(
         uid,
         host,
-        remark=(
-            f"pxpanel-"
-            f"{link.get('label', '')}"
-        ),
+        remark=str(link.get("label") or "Config"),
         protocol=link.get(
             "protocol",
             DEFAULT_PROTOCOL,
@@ -998,92 +978,51 @@ def get_link_info(
     uid: str,
     host: str,
 ):
+    connected_count = len(unique_ips_for_uuid(uid))
+    is_active = is_link_allowed(link)
+    limit_b = int(link.get("limit_bytes", 0) or 0)
+    used_b = int(link.get("used_bytes", 0) or 0)
+    is_expired = is_link_expired(link) or (limit_b > 0 and used_b >= limit_b)
+    if not is_active or is_expired:
+        status_color = "red"
+    elif connected_count > 0:
+        status_color = "green"
+    else:
+        status_color = "gray"
+    clean_ips = link.get("clean_ips") or []
+    cfg_count = int(link.get("config_count") or 1)
+    show_vless = len(clean_ips) <= 1 and cfg_count <= 1
+    cat = CATEGORIES.get(str(link.get("category_id") or "0")) or {}
     return {
         "uuid": uid,
-        "name": link.get(
-            "label",
-            "",
-        ),
-        "label": link.get(
-            "label",
-            "",
-        ),
-        "protocol": link.get(
-            "protocol",
-            DEFAULT_PROTOCOL,
-        ),
-        "active": is_link_allowed(link),
-        "used_bytes": int(
-            link.get(
-                "used_bytes",
-                0,
-            )
-            or 0
-        ),
-        "limit_bytes": int(
-            link.get(
-                "limit_bytes",
-                0,
-            )
-            or 0
-        ),
-        "expires_at": link.get(
-            "expires_at"
-        ),
-        "ip_limit": int(
-            link.get(
-                "ip_limit",
-                0,
-            )
-            or 0
-        ),
-        "speed_limit_bytes": int(
-            link.get(
-                "speed_limit_bytes",
-                0,
-            )
-            or 0
-        ),
-        "connection_limit": int(
-            link.get(
-                "connection_limit",
-                0,
-            )
-            or 0
-        ),
-        "fragment": link.get(
-            "fragment",
-            "off",
-        ),
-        "fingerprint": link.get(
-            "fingerprint",
-            DEFAULT_FINGERPRINT,
-        ),
-        "alpn": link.get(
-            "alpn",
-            "",
-        ),
-        "port": link.get(
-            "port",
-            DEFAULT_PORT,
-        ),
-        "note": link.get(
-            "note",
-            "",
-        ),
-        "vless": vless_link_for_link(
-            link,
-            uid,
-            host,
-        ),
-        "sub": (
-            f"https://{host}"
-            f"/sub/{uid}"
-        ),
-        "info": (
-            f"https://{host}"
-            f"/info/{uid}"
-        ),
+        "name": link.get("label", ""),
+        "label": link.get("label", ""),
+        "protocol": link.get("protocol", DEFAULT_PROTOCOL),
+        "active": is_active,
+        "used_bytes": used_b,
+        "limit_bytes": limit_b,
+        "expires_at": link.get("expires_at"),
+        "ip_limit": int(link.get("ip_limit", 0) or 0),
+        "speed_limit_bytes": int(link.get("speed_limit_bytes", 0) or 0),
+        "connection_limit": int(link.get("connection_limit", 0) or 0),
+        "fragment": link.get("fragment", "off"),
+        "fingerprint": link.get("fingerprint", DEFAULT_FINGERPRINT),
+        "alpn": link.get("alpn", ""),
+        "port": link.get("port", DEFAULT_PORT),
+        "note": link.get("note", ""),
+        "clean_ips": clean_ips,
+        "alarm_enabled": bool(link.get("alarm_enabled", False)),
+        "category_id": str(link.get("category_id") or "0"),
+        "category_number": int(cat.get("number", 0)),
+        "category_name": str(cat.get("name", "عمومی")),
+        "config_count": cfg_count,
+        "status_color": status_color,
+        "connected_ips": connected_count,
+        "show_vless": show_vless,
+        "vless": vless_link_for_link(link, uid, host) if show_vless else "",
+        "vless_full": vless_link_for_link(link, uid, host),
+        "sub": f"https://{host}/sub/{uid}",
+        "info": f"https://{host}/info/{uid}",
         "support": SUPPORT_USERNAME,
     }
 
@@ -1125,6 +1064,13 @@ async def load_state():
         SUBS.update(
             data.get(
                 "subs",
+                {},
+            )
+        )
+
+        CATEGORIES.update(
+            data.get(
+                "categories",
                 {},
             )
         )
@@ -1185,6 +1131,11 @@ async def load_state():
                 "used_bytes",
                 0,
             )
+            link.setdefault("clean_ips", [])
+            link.setdefault("alarm_enabled", False)
+            link.setdefault("category_id", "0")
+            link.setdefault("config_count", 1)
+            link.setdefault("usage_history", [])
 
         logger.info(
             "State loaded: %d links / %d subscriptions",
@@ -1217,6 +1168,9 @@ async def save_state():
 
                 "subs":
                     dict(SUBS),
+
+                "categories":
+                    dict(CATEGORIES),
 
                 "password_hash":
                     AUTH[
@@ -1265,6 +1219,26 @@ async def save_state():
 
 _default_link_created = False
 
+
+
+async def ensure_default_categories():
+    if CATEGORIES:
+        return
+    CATEGORIES["0"] = {
+        "id": "0", "name": "عمومی", "number": 0,
+        "limit_bytes": 0, "expires_days": 0, "connection_limit": 0,
+        "speed_limit_bytes": 0, "ip_limit": 0, "clean_ips": [],
+        "random_name": False, "single_user": False,
+        "created_at": datetime.now().isoformat(),
+    }
+    CATEGORIES["1"] = {
+        "id": "1", "name": "VIP", "number": 1,
+        "limit_bytes": 0, "expires_days": 0, "connection_limit": 1,
+        "speed_limit_bytes": 0, "ip_limit": 1, "clean_ips": [],
+        "random_name": False, "single_user": True,
+        "created_at": datetime.now().isoformat(),
+    }
+    asyncio.create_task(save_state())
 
 async def ensure_default_link():
 
@@ -1373,10 +1347,13 @@ async def make_link(
     speed_limit_bytes: int = 0,
     connection_limit: int = 0,
     fragment: str = "off",
+    clean_ips=None,
+    alarm_enabled: bool = False,
+    category_id: str = "0",
+    config_count: int = 1,
 ):
 
-    if protocol not in PROTOCOLS:
-        protocol = DEFAULT_PROTOCOL
+    protocol = normalize_protocol(protocol)
 
     fingerprint = (
         fingerprint
@@ -1397,10 +1374,7 @@ async def make_link(
 
     record = {
         "label":
-            (
-                label
-                or "لینک جدید"
-            ).strip()[:60],
+            sanitize_config_name((label or "").strip() or random_config_name()),
 
         "limit_bytes":
             max(
@@ -1470,6 +1444,15 @@ async def make_link(
                 fragment
                 or "off"
             ).strip().lower(),
+
+        "security_profile": "balanced",
+        "multi_login": False,
+        "protocol_label": PROTOCOL_LABELS.get(protocol, protocol),
+        "clean_ips": list(clean_ips or []),
+        "alarm_enabled": bool(alarm_enabled),
+        "category_id": str(category_id or "0"),
+        "config_count": max(1, min(40, int(config_count or 1))),
+        "usage_history": [],
     }
 
     async with LINKS_LOCK:
@@ -1827,6 +1810,7 @@ async def startup():
 
     await load_state()
 
+    await ensure_default_categories()
     await ensure_default_link()
 
     log_activity(
@@ -1872,7 +1856,7 @@ LANDING_HTML = r"""
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 
-<title>PXpanel</title>
+<title>PX Panel</title>
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1903,12 +1887,12 @@ body{
     background:
         radial-gradient(
             circle at 15% 15%,
-            rgba(99,102,241,.22),
+            rgba(37,99,235,.22),
             transparent 30%
         ),
         radial-gradient(
             circle at 85% 85%,
-            rgba(139,92,246,.18),
+            rgba(59,130,246,.18),
             transparent 30%
         ),
         #07070a;
@@ -1956,8 +1940,8 @@ body{
     background:
         linear-gradient(
             135deg,
-            #6366f1,
-            #8b5cf6
+            #2563eb,
+            #3b82f6
         );
 }
 
@@ -1969,7 +1953,7 @@ body{
 .version{
     margin-top:4px;
     font-size:11px;
-    color:#a78bfa;
+    color:#60a5fa;
 }
 
 .status{
@@ -2009,7 +1993,7 @@ h1{
     direction:ltr;
     text-align:left;
     font-family:Consolas,monospace;
-    color:#c4b5fd;
+    color:#93c5fd;
 }
 
 .actions{
@@ -2034,8 +2018,8 @@ h1{
     background:
         linear-gradient(
             135deg,
-            #6366f1,
-            #8b5cf6
+            #2563eb,
+            #3b82f6
         );
 }
 
@@ -2058,7 +2042,7 @@ h1{
 }
 
 .support{
-    color:#a78bfa;
+    color:#60a5fa;
     text-decoration:none;
 }
 
@@ -2076,6 +2060,12 @@ h1{
         flex-direction:column;
     }
 }
+
+/* PXPanel 13.0.1 responsive system */
+html{scroll-behavior:smooth} body{overflow-x:hidden} button,input,select,textarea{touch-action:manipulation} .modal{overscroll-behavior:contain}
+@media(max-width:900px){.container,.shell,.dashboard,.main,.content{max-width:100%!important;width:100%!important}.grid,.stats-grid,.cards-grid,.form-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}.sidebar{z-index:1000}}
+@media(max-width:640px){body{padding:10px!important;font-size:14px}.grid,.stats-grid,.cards-grid,.form-grid{grid-template-columns:1fr!important}.card,.panel,.section,.modal{border-radius:18px!important}.modal{max-height:92vh;overflow:auto;padding:14px!important}.header,.topbar,.toolbar,.actions{flex-wrap:wrap!important}.header>* ,.topbar>*{max-width:100%}.btn,button{min-height:44px}.field input,.field select,.field textarea,input,select,textarea{min-height:44px;font-size:16px;max-width:100%}table{display:block;overflow-x:auto;white-space:nowrap}.link-row,.config-row{flex-direction:column!important;align-items:stretch!important}.brand-name{font-size:15px}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
 </style>
 </head>
 
@@ -2089,11 +2079,11 @@ h1{
 
 <div>
 <div class="brand-name">
-PXpanel
+PX Panel
 </div>
 
 <div class="version">
-12.1.0 Beta
+13.6.1
 </div>
 </div>
 
@@ -2110,7 +2100,7 @@ PXpanel
 </h1>
 
 <div class="desc">
-این صفحه، درگاه عمومی PXpanel است.
+این صفحه، درگاه عمومی PX Panel است.
 برای دسترسی به داشبورد مدیریت از مسیر ورود استفاده کنید.
 </div>
 
@@ -2141,7 +2131,7 @@ class="btn secondary"
 <div class="footer">
 
 <span>
-PXpanel · 12.1.0 Beta
+PX Panel · 13.6.1
 </span>
 
 <a
@@ -2216,7 +2206,7 @@ name="viewport"
 content="width=device-width,initial-scale=1"
 >
 
-<title>ورود | PXpanel</title>
+<title>ورود | PX Panel</title>
 
 <link
 rel="preconnect"
@@ -2256,7 +2246,7 @@ body{
     background:
         radial-gradient(
             circle at 15% 15%,
-            rgba(99,102,241,.20),
+            rgba(37,99,235,.20),
             transparent 32%
         ),
         #07070a;
@@ -2293,8 +2283,8 @@ body{
     background:
         linear-gradient(
             135deg,
-            #6366f1,
-            #8b5cf6
+            #2563eb,
+            #3b82f6
         );
 }
 
@@ -2305,7 +2295,7 @@ h1{
 
 .version{
     margin-top:5px;
-    color:#a78bfa;
+    color:#60a5fa;
     font-size:11px;
 }
 
@@ -2365,8 +2355,8 @@ button{
     background:
         linear-gradient(
             135deg,
-            #6366f1,
-            #8b5cf6
+            #2563eb,
+            #3b82f6
         );
 }
 
@@ -2388,7 +2378,7 @@ button{
     margin-top:18px;
     text-align:center;
 
-    color:#a78bfa;
+    color:#60a5fa;
     text-decoration:none;
 
     font-size:11px;
@@ -2407,11 +2397,11 @@ P
 </div>
 
 <h1>
-ورود به PXpanel
+ورود به PX Panel
 </h1>
 
 <div class="version">
-12.1.0 Beta
+13.6.1
 </div>
 
 <div class="desc">
@@ -3041,11 +3031,41 @@ async def create_link_api(
     if fragment not in allowed_fragments:
         fragment = "off"
 
+    raw_clean = body.get("clean_ips") or body.get("clean_ip") or ""
+    if isinstance(raw_clean, list):
+        clean_ips = [str(x).strip() for x in raw_clean if str(x).strip()]
+    else:
+        clean_ips = [x.strip() for x in str(raw_clean).replace(",", "\n").splitlines() if x.strip()]
+    alarm_enabled = bool(body.get("alarm_enabled", False))
+    category_id = str(body.get("category_id") or "0")
+    if category_id not in CATEGORIES:
+        category_id = "0"
+    config_count = safe_int(body.get("config_count", 1), minimum=1, maximum=40)
+    cat = CATEGORIES.get(category_id) or {}
+    if cat.get("limit_bytes") and limit_bytes <= 0:
+        limit_bytes = int(cat["limit_bytes"])
+    if cat.get("expires_days") and expires_days <= 0:
+        expires_days = int(cat["expires_days"])
+        expires_at = (datetime.now() + timedelta(days=expires_days)).isoformat() if expires_days > 0 else None
+    if cat.get("connection_limit") and connection_limit <= 0:
+        connection_limit = int(cat["connection_limit"])
+    if cat.get("speed_limit_bytes") and speed_bytes <= 0:
+        speed_bytes = int(cat["speed_limit_bytes"])
+    if cat.get("ip_limit") and ip_limit <= 0:
+        ip_limit = int(cat["ip_limit"])
+    if cat.get("clean_ips") and not clean_ips:
+        clean_ips = list(cat["clean_ips"])
+    if cat.get("single_user"):
+        if ip_limit == 0: ip_limit = 1
+        if connection_limit == 0: connection_limit = 1
+    label_val = body.get("label", "")
+    if cat.get("random_name") or not str(label_val).strip():
+        label_val = random_config_name()
+    else:
+        label_val = sanitize_config_name(str(label_val))
+
     uid, link = await make_link(
-        label=body.get(
-            "label",
-            auto_config_name(),
-        ),
+        label=label_val,
         limit_bytes=limit_bytes,
         expires_at=expires_at,
         note=body.get(
@@ -3069,6 +3089,10 @@ async def create_link_api(
         speed_limit_bytes=speed_bytes,
         connection_limit=connection_limit,
         fragment=fragment,
+        clean_ips=clean_ips,
+        alarm_enabled=alarm_enabled,
+        category_id=category_id,
+        config_count=config_count,
     )
 
     host = get_host(request)
@@ -3094,92 +3118,43 @@ async def create_auto_link(
     request: Request,
     _=Depends(require_auth),
 ):
-
     try:
-
-        host = get_host(request)
-
-        uid, link = await make_link(
-            label=auto_config_name(),
-
-            # Unlimited
-            limit_bytes=0,
-            expires_at=None,
-            ip_limit=0,
-            speed_limit_bytes=0,
-            connection_limit=0,
-
-            note=(
-                "Auto generated by "
-                "PXpanel"
-            ),
-
-            # IMPORTANT:
-            # Keep working protocol.
-            protocol="vless-ws",
-
-            fingerprint="chrome",
-
-            alpn="http/1.1",
-
-            port=443,
-
-            fragment="off",
-        )
-
-        result = {
-            **get_link_info(
-                link,
-                uid,
-                host,
-            ),
-            "ok": True,
-        }
-
-        log_activity(
-            "link",
-            (
-                f"کانفیگ خودکار "
-                f"«{link['label']}» ساخته شد"
-            ),
-            "ok",
-        )
-
-        return result
-
-    except Exception as exc:
-
-        logger.exception(
-            "Auto config creation failed"
-        )
-
-        stats["total_errors"] += 1
-
-        error_logs.append(
-            {
-                "error":
-                    str(exc),
-
-                "path":
-                    "/api/links/auto",
-
-                "time":
-                    datetime.now().isoformat(),
-            }
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "خطا در ساخت کانفیگ: "
-                f"{exc}"
-            ),
-        )
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict): body = {}
+    host = get_host(request)
+    protocol = normalize_protocol(body.get("protocol", DEFAULT_PROTOCOL))
+    profile = str(body.get("profile", "balanced")).strip().lower()
+    profiles = {
+        "normal": {"ip":0,"conn":0,"speed":0,"fp":"chrome","fragment":"off"},
+        "balanced": {"ip":2,"conn":4,"speed":0,"fp":"chrome","fragment":"safe"},
+        "gaming": {"ip":1,"conn":2,"speed":0,"fp":"chrome","fragment":"safe"},
+        "maximum": {"ip":0,"conn":0,"speed":0,"fp":"randomized","fragment":"safe"},
+    }
+    cfg = profiles.get(profile, profiles["balanced"])
+    uid, link = await make_link(
+        label=auto_config_name(), limit_bytes=0, expires_at=None,
+        ip_limit=cfg["ip"], speed_limit_bytes=cfg["speed"], connection_limit=cfg["conn"],
+        note=f"Auto generated by PXPanel | profile={profile}",
+        protocol=protocol, fingerprint=cfg["fp"],
+        alpn=DEFAULT_ALPN_BY_PROTOCOL.get(protocol, ""), port=443, fragment=cfg["fragment"],
+    )
+    link["security_profile"] = profile
+    result = {**get_link_info(link, uid, host), "ok": True, "profile": profile}
+    log_activity("link", f"کانفیگ خودکار «{link['label']}» با {PROTOCOL_LABELS.get(protocol, protocol)} ساخته شد", "ok")
+    return result
 
 
 # ============================================================
 # LIST LINKS
 # ============================================================
+
+@app.get("/api/protocols")
+async def api_protocols(request: Request):
+    require_auth(request)
+    return {"protocols": [{"id": p, "label": PROTOCOL_LABELS.get(p, p)} for p in PROTOCOLS], "default": DEFAULT_PROTOCOL}
+
 
 @app.get("/api/links")
 async def list_links(
@@ -3800,26 +3775,50 @@ async def subscription_single(
         )
 
     host = get_host(request)
-
-    vless = vless_link_for_link(
-        link,
-        uuid,
-        host,
-    )
-
-    content = (
-        base64
-        .b64encode(
-            vless.encode()
-        )
-        .decode()
-    )
-
+    clean_ips = link.get("clean_ips") or []
     used = int(link.get("used_bytes", 0) or 0)
     limit = int(link.get("limit_bytes", 0) or 0)
-    volume_text = f"{fmt_bytes(used)}/{fmt_bytes(limit)}" if limit > 0 else f"{fmt_bytes(used)}/∞"
-    expiry_text = str(link.get("expires_at") or "∞")
-    profile_title = f"0.0.0.0 | {volume_text} | {expiry_text} | {link.get('label','PXpanel')} | کانال تلگرام: logic_sec"
+    remaining = max(0, limit - used) if limit > 0 else 0
+    volume_text = f"{fmt_bytes(used)}/{fmt_bytes(limit)} (باقی {fmt_bytes(remaining)})" if limit > 0 else f"{fmt_bytes(used)}/∞"
+    expires_at = link.get("expires_at")
+    if expires_at:
+        try:
+            exp_dt = datetime.fromisoformat(str(expires_at))
+            now_dt = datetime.now(exp_dt.tzinfo) if getattr(exp_dt, "tzinfo", None) else datetime.now()
+            secs = int((exp_dt - now_dt).total_seconds())
+            if secs <= 0:
+                time_text = "منقضی"
+            else:
+                days, rem = divmod(secs, 86400)
+                hours, rem = divmod(rem, 3600)
+                mins = rem // 60
+                time_text = f"{days}د {hours}س" if days else (f"{hours}س {mins}د" if hours else f"{mins}د")
+        except Exception:
+            time_text = str(expires_at)[:16]
+    else:
+        time_text = "∞"
+    label = str(link.get("label") or "Config")
+    stats_remark = f"{label} | {volume_text} | {time_text}"
+    stats_line = generate_vless_link(uuid, "0.0.0.0", remark=stats_remark, protocol=link.get("protocol", DEFAULT_PROTOCOL), fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT), alpn=link.get("alpn"), port=link.get("port", DEFAULT_PORT))
+    lines = [stats_line]
+    used_names = set()
+    cfg_count = max(1, min(40, int(link.get("config_count") or 1)))
+    if clean_ips:
+        hosts = list(clean_ips)
+        while len(hosts) < cfg_count:
+            hosts.extend(clean_ips)
+        hosts = hosts[:cfg_count]
+        for cip in hosts:
+            name = random_config_name(used_names)
+            used_names.add(name)
+            lines.append(generate_vless_link(uuid, cip, remark=name, protocol=link.get("protocol", DEFAULT_PROTOCOL), fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT), alpn=link.get("alpn"), port=link.get("port", DEFAULT_PORT)))
+    else:
+        for i in range(cfg_count):
+            name = random_config_name(used_names)
+            used_names.add(name)
+            lines.append(generate_vless_link(uuid, host, remark=name, protocol=link.get("protocol", DEFAULT_PROTOCOL), fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT), alpn=link.get("alpn"), port=link.get("port", DEFAULT_PORT)))
+    content = base64.b64encode("\n".join(lines).encode()).decode()
+    profile_title = f"0.0.0.0 | {stats_remark}"
     headers = subscription_metadata_headers(
         used,
         limit,
@@ -3932,123 +3931,514 @@ async def info_page(
 
     status_text = "فعال" if is_link_allowed(snapshot) else "غیرفعال"
     status_class = "good" if status_text == "فعال" else "bad"
-    ip_limit = "نامحدود" if not snapshot.get("ip_limit",0) else str(snapshot.get("ip_limit"))
-    connection_limit = "نامحدود" if not snapshot.get("connection_limit",0) else str(snapshot.get("connection_limit"))
-    speed_limit = "نامحدود" if not snapshot.get("speed_limit_bytes",0) else fmt_bytes(snapshot.get("speed_limit_bytes",0)) + "/s"
+    ip_limit = "نامحدود" if not snapshot.get("ip_limit", 0) else str(snapshot.get("ip_limit"))
+    connection_limit = "نامحدود" if not snapshot.get("connection_limit", 0) else str(snapshot.get("connection_limit"))
+    speed_limit = "نامحدود" if not snapshot.get("speed_limit_bytes", 0) else fmt_bytes(snapshot.get("speed_limit_bytes", 0)) + "/s"
+
+    usage_history = snapshot.get("usage_history", [])
+    svg_points = "0,50 300,50"
+    if usage_history and len(usage_history) > 1:
+        max_hist = max(usage_history) if max(usage_history) > 0 else 1
+        pts = []
+        step = 300 / (len(usage_history) - 1)
+        for i, val in enumerate(usage_history):
+            x = i * step
+            y = 60 - min(60, max(4, (val / max_hist) * 52))
+            pts.append(f"{x:.1f},{y:.1f}")
+        svg_points = " ".join(pts)
+    elif usage_history and len(usage_history) == 1:
+        svg_points = f"0,50 300,{60 - min(60, max(4, (usage_history[0] / (limit if limit > 0 else max(used, 1))) * 52)):.1f}"
+
+    status_badge_html = 'text-emerald-300 border border-emerald-400/25 bg-emerald-400/10' if status_class == 'good' else 'text-rose-300 border border-rose-400/25 bg-rose-400/10'
+    label_escaped = escape_html(snapshot.get("label", "PXpanel"))
+    uid_escaped = escape_html(uid)
+    app_version_str = escape_html(str(APP_VERSION))
+    used_bytes_str = escape_html(fmt_bytes(used))
+    limit_bytes_str = escape_html(fmt_bytes(limit)) if limit > 0 else '∞'
+    remaining_value_escaped = escape_html(remaining_value)
+    expiry_remaining_escaped = escape_html(expiry_remaining)
+    expiry_display_escaped = escape_html(expiry_display)
+    ip_limit_escaped = escape_html(ip_limit)
+    connection_limit_escaped = escape_html(connection_limit)
+    speed_limit_escaped = escape_html(speed_limit)
+    protocol_escaped = escape_html(snapshot.get("protocol", "vless-ws"))
+    fingerprint_escaped = escape_html(snapshot.get("fingerprint", "chrome"))
+    vless_url_escaped = escape_html(vless_url)
+    sub_url_escaped = escape_html(sub_url)
+    dash_calc_offset = f"{339.29 - (339.29 * min(usage_percent, 100) / 100):.1f}"
 
     info_html = f"""<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>{escape_html(snapshot.get("label","PXpanel"))} | INFO</title>
+<title>{label_escaped} | INFO</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
+<script>
+  tailwind.config = {{
+    theme: {{
+      extend: {{
+        fontFamily: {{ vazir: ['Vazirmatn','system-ui','sans-serif'] }}
+      }}
+    }}
+  }}
+</script>
 <style>
-:root{{--bg:#07080d;--panel:rgba(17,19,28,.72);--line:rgba(255,255,255,.08);--muted:rgba(255,255,255,.42);--text:#f6f7fb;--green:#34d399;--blue:#60a5fa;--orange:#f59e0b;--red:#fb7185;--purple:#a78bfa}}
-*{{box-sizing:border-box}}
-html,body{{margin:0;min-height:100%;background:var(--bg)}}
-body{{font-family:"Vazirmatn",sans-serif;color:var(--text);padding:24px;background:radial-gradient(circle at 15% 0%,rgba(96,165,250,.16),transparent 30%),radial-gradient(circle at 95% 30%,rgba(167,139,250,.13),transparent 28%),radial-gradient(circle at 80% 100%,rgba(52,211,153,.08),transparent 30%),#07080d}}
-.page{{width:min(920px,100%);margin:auto}}
-.shell{{position:relative;overflow:hidden;border:1px solid var(--line);background:linear-gradient(145deg,rgba(255,255,255,.05),rgba(255,255,255,.02));backdrop-filter:blur(28px);border-radius:30px;box-shadow:0 35px 100px rgba(0,0,0,.38)}}
-.shell:before{{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(120deg,rgba(255,255,255,.04),transparent 35%,rgba(255,255,255,.02))}}
-.hero{{position:relative;padding:25px 25px 20px;border-bottom:1px solid rgba(255,255,255,.06)}}
-.hero-row{{display:flex;align-items:center;justify-content:space-between;gap:16px}}
-.brand{{display:flex;align-items:center;gap:13px}}
-.brand-icon{{width:46px;height:46px;display:grid;place-items:center;border:1px solid rgba(96,165,250,.2);background:linear-gradient(145deg,rgba(96,165,250,.14),rgba(167,139,250,.08));border-radius:15px;color:#93c5fd;font-weight:900;font-size:16px}}
-.hero h1{{margin:0;font-size:21px;font-weight:900;letter-spacing:-.35px}}
-.hero-meta{{margin-top:4px;color:var(--muted);font-size:9px;word-break:break-all}}
-.status{{display:inline-flex;align-items:center;gap:7px;padding:8px 11px;border-radius:12px;font-size:9px;font-weight:800;white-space:nowrap}}
-.status i{{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 14px currentColor}}
-.status.good{{color:#6ee7b7;border:1px solid rgba(52,211,153,.18);background:rgba(52,211,153,.08)}}
-.status.bad{{color:#fda4af;border:1px solid rgba(251,113,133,.18);background:rgba(251,113,133,.08)}}
-.notice{{margin-top:18px;display:flex;gap:11px;align-items:flex-start;padding:13px 14px;border:1px solid rgba(167,139,250,.17);background:linear-gradient(120deg,rgba(167,139,250,.10),rgba(96,165,250,.04));border-radius:16px;color:rgba(255,255,255,.62);font-size:9px;line-height:2}}
-.notice-icon{{width:25px;height:25px;flex:0 0 25px;display:grid;place-items:center;border-radius:9px;background:rgba(167,139,250,.13);border:1px solid rgba(167,139,250,.18);color:#c4b5fd;font-size:12px}}
-.notice strong{{color:#ddd6fe}}
-.dashboard{{display:grid;grid-template-columns:1.35fr .65fr;gap:12px;padding:16px}}
-.usage-card,.side-card{{border:1px solid var(--line);background:rgba(255,255,255,.025);border-radius:20px}}
-.usage-card{{padding:18px}}
-.section-kicker{{font-size:8px;color:rgba(255,255,255,.30);font-weight:800;letter-spacing:.7px;text-transform:uppercase}}
-.section-title{{margin-top:4px;font-size:13px;font-weight:900}}
-.usage-line{{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-top:16px}}
-.usage-number{{font-size:22px;font-weight:900;letter-spacing:-.5px}}
-.usage-number span{{font-size:10px;color:var(--muted);font-weight:600}}
-.usage-percent{{font-size:12px;font-weight:900;color:#86efac}}
-.track{{height:12px;margin-top:12px;border-radius:999px;background:rgba(255,255,255,.055);overflow:hidden;border:1px solid rgba(255,255,255,.035)}}
-.track span{{display:block;height:100%;width:{usage_percent}%;border-radius:inherit;background:linear-gradient(90deg,#34d399,#f59e0b);box-shadow:0 0 20px rgba(52,211,153,.18)}}
-.usage-bottom{{display:flex;justify-content:space-between;gap:10px;margin-top:9px;color:var(--muted);font-size:8px}}
-.side-card{{padding:14px}}
-.side-row{{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.05)}}
-.side-row:last-child{{border-bottom:0;padding-bottom:0}}
-.side-label{{font-size:8px;color:var(--muted)}}
-.side-value{{font-size:9px;font-weight:800}}
-.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;padding:0 16px 16px}}
-.metric{{position:relative;overflow:hidden;padding:14px 14px 13px;border-radius:18px;border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.025)}}
-.metric:before{{content:"";position:absolute;inset:0;background:linear-gradient(145deg,rgba(255,255,255,.025),transparent 55%)}}
-.metric .dot{{width:8px;height:8px;border-radius:50%;margin-bottom:9px;background:var(--c);box-shadow:0 0 18px color-mix(in srgb,var(--c) 45%,transparent)}}
-.metric-label{{color:var(--muted);font-size:8px}}
-.metric-value{{margin-top:5px;font-size:12px;font-weight:900;color:var(--c);word-break:break-word}}
-.metric.green{{--c:#34d399}} .metric.orange{{--c:#f59e0b}} .metric.blue{{--c:#60a5fa}} .metric.purple{{--c:#a78bfa}}
-.content{{padding:0 16px 18px}}
-.section{{margin-top:10px;padding:16px;border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.022);border-radius:20px}}
-.section-head{{display:flex;align-items:end;justify-content:space-between;gap:10px}}
-.section-head .section-title{{margin:0}}
-.section-sub{{color:var(--muted);font-size:8px}}
-.info-grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:9px;margin-top:12px}}
-.info-item{{padding:12px;border-radius:15px;border:1px solid rgba(255,255,255,.06);background:rgba(0,0,0,.13)}}
-.info-label{{font-size:8px;color:var(--muted)}}
-.info-value{{margin-top:5px;font-size:9px;font-weight:700;color:rgba(255,255,255,.86);word-break:break-word}}
-.code{{direction:ltr;text-align:left;font-family:Consolas,monospace;font-size:8.5px;color:#c4b5fd;font-weight:500}}
-.link-card{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;border-radius:15px;border:1px solid rgba(255,255,255,.06);background:rgba(0,0,0,.13);margin-top:9px}}
-.link-card:first-child{{margin-top:12px}}
-.link-main{{min-width:0}}
-.link-name{{font-size:8px;color:var(--muted);font-weight:800}}
-.link-url{{margin-top:4px;direction:ltr;text-align:left;font-family:Consolas,monospace;font-size:8px;color:#c4b5fd;word-break:break-all}}
-.copy-hint{{flex:0 0 auto;font-size:8px;color:rgba(255,255,255,.28)}}
-.downloads{{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:12px}}
-.download{{display:flex;align-items:center;gap:10px;min-height:68px;padding:12px;text-decoration:none;color:#fff;border:1px solid rgba(255,255,255,.07);background:linear-gradient(145deg,rgba(255,255,255,.035),rgba(255,255,255,.015));border-radius:16px;transition:transform .2s ease,border-color .2s ease,background .2s ease}}
-.download:hover{{transform:translateY(-2px);border-color:rgba(96,165,250,.28);background:linear-gradient(145deg,rgba(96,165,250,.07),rgba(255,255,255,.02))}}
-.app-icon{{width:31px;height:31px;flex:0 0 31px;display:grid;place-items:center;border-radius:10px;background:rgba(96,165,250,.11);border:1px solid rgba(96,165,250,.14);color:#93c5fd;font-size:11px;font-weight:900}}
-.download strong{{display:block;font-size:9px}}
-.download span{{display:block;margin-top:2px;color:var(--muted);font-size:7.5px}}
-.channel{{margin-top:15px;padding:12px 14px;text-align:center;border:1px solid rgba(52,211,153,.12);background:rgba(52,211,153,.045);border-radius:14px;color:var(--muted);font-size:8px}}
-.channel b{{color:#6ee7b7}}
-@media(max-width:760px){{body{{padding:12px}}.dashboard{{grid-template-columns:1fr}}.stats{{grid-template-columns:repeat(2,1fr)}}.downloads{{grid-template-columns:1fr}}.hero-row{{align-items:flex-start;flex-direction:column}}}}
+  :root {{
+    --bg-main: #05060a;
+    --bg-card: rgba(255, 255, 255, 0.04);
+    --bg-card-hover: rgba(255, 255, 255, 0.07);
+    --border-color: rgba(255, 255, 255, 0.1);
+    --text-main: #f1f5f9;
+    --text-muted: rgba(255, 255, 255, 0.4);
+    --bg-sub-card: rgba(0, 0, 0, 0.2);
+    --grad-1: rgba(96,165,250,.16);
+    --grad-2: rgba(96,165,250,.13);
+    --grad-3: rgba(52,211,153,.08);
+  }}
+
+  body.theme-lighter {{
+    --bg-main: #131722;
+    --bg-card: rgba(255, 255, 255, 0.075);
+    --bg-card-hover: rgba(255, 255, 255, 0.115);
+    --border-color: rgba(255, 255, 255, 0.16);
+    --text-main: #ffffff;
+    --text-muted: rgba(255, 255, 255, 0.6);
+    --bg-sub-card: rgba(0, 0, 0, 0.35);
+    --grad-1: rgba(96,165,250,.24);
+    --grad-2: rgba(96,165,250,.20);
+    --grad-3: rgba(52,211,153,.13);
+  }}
+
+  html,body{{background:var(--bg-main); transition: background 0.3s ease, color 0.3s ease;}}
+  body{{
+    background:
+      radial-gradient(ellipse 80% 50% at 10% -10%, var(--grad-1), transparent 50%),
+      radial-gradient(ellipse 60% 40% at 95% 15%, var(--grad-2), transparent 45%),
+      radial-gradient(ellipse 55% 35% at 60% 100%, var(--grad-3), transparent 40%),
+      var(--bg-main);
+  }}
+  .status-dot{{box-shadow:0 0 10px currentColor}}
+  ::-webkit-scrollbar{{width:8px;height:8px}}
+  ::-webkit-scrollbar-thumb{{background:rgba(255,255,255,.12);border-radius:99px}}
+  * {{ box-shadow: none !important; }}
+  .copy-btn svg{{transition:none}}
+  
+  .dynamic-card {{
+    background-color: var(--bg-card);
+    border-color: var(--border-color);
+    transition: background-color 0.3s ease, border-color 0.3s ease;
+  }}
+  .dynamic-card:hover {{
+    background-color: var(--bg-card-hover);
+  }}
+  .sub-box {{
+    background-color: var(--bg-sub-card);
+  }}
 </style>
 </head>
-<body>
-<div class="page"><div class="shell">
-<section class="hero">
-<div class="hero-row"><div class="brand"><div class="brand-icon">PX</div><div><h1>{escape_html(snapshot.get("label","PXpanel"))}</h1><div class="hero-meta">0.0.0.0 · UUID: {escape_html(uid)} · PXpanel {APP_VERSION}</div></div></div><div class="status {status_class}"><i></i>{status_text}</div></div>
-<div class="notice"><div class="notice-icon">!</div><div><strong>اطلاعیه اتصال</strong><br>لینک SUB را در برنامه‌ای که استفاده می‌کنید به‌عنوان Subscription وارد کنید. برای اتصال مستقیم نیز می‌توانید VLESS را Import کنید. <strong>کانال تلگرام: logic_sec</strong></div></div>
-</section>
+<body class="font-vazir text-slate-100 antialiased min-h-screen py-8 px-3 sm:px-4 md:py-14">
 
-<section class="dashboard">
-<div class="usage-card"><div class="section-kicker">Traffic Overview</div><div class="section-title">مصرف سرویس</div><div class="usage-line"><div class="usage-number">{escape_html(fmt_bytes(used))} <span>/ {escape_html(fmt_bytes(limit)) if limit > 0 else '∞'}</span></div><div class="usage-percent">{usage_percent}%</div></div><div class="track"><span></span></div><div class="usage-bottom"><span>باقی‌مانده: {escape_html(remaining_value)}</span><span>زمان: {escape_html(expiry_remaining)}</span></div></div>
-<div class="side-card"><div class="section-kicker">Service</div><div class="side-row"><span class="side-label">انقضا</span><span class="side-value">{escape_html(expiry_display)}</span></div><div class="side-row"><span class="side-label">IP Limit</span><span class="side-value">{escape_html(ip_limit)}</span></div><div class="side-row"><span class="side-label">Connection</span><span class="side-value">{escape_html(connection_limit)}</span></div><div class="side-row"><span class="side-label">Speed</span><span class="side-value">{escape_html(speed_limit)}</span></div></div>
-</section>
+<div class="w-full max-w-4xl mx-auto space-y-5 sm:space-y-6 md:space-y-8">
 
-<section class="stats">
-<div class="metric green"><div class="dot"></div><div class="metric-label">مصرف فعلی</div><div class="metric-value">{escape_html(fmt_bytes(used))}</div></div>
-<div class="metric orange"><div class="dot"></div><div class="metric-label">باقی‌مانده</div><div class="metric-value">{escape_html(remaining_value)}</div></div>
-<div class="metric blue"><div class="dot"></div><div class="metric-label">اتصالات فعال</div><div class="metric-value">{len(unique_ips_for_uuid(uid))}</div></div>
-<div class="metric purple"><div class="dot"></div><div class="metric-label">زمان باقی‌مانده</div><div class="metric-value">{escape_html(expiry_remaining)}</div></div>
-</section>
+  <!-- Top Bar Theme Toggle Button -->
+  <div class="flex justify-end">
+    <button type="button" onclick="toggleTheme()" class="inline-flex items-center gap-1.5 px-4 py-2 rounded-full text-xs font-extrabold text-amber-300 border border-amber-400/30 bg-amber-400/10 hover:bg-amber-400/20 transition-colors shadow-lg">
+      <svg id="themeIcon" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+      تغییر تم
+    </button>
+  </div>
 
-<div class="content">
-<section class="section"><div class="section-head"><div class="section-title">جزئیات فنی</div><div class="section-sub">Configuration Details</div></div><div class="info-grid"><div class="info-item"><div class="info-label">Protocol</div><div class="info-value code">{escape_html(snapshot.get("protocol","vless-ws"))}</div></div><div class="info-item"><div class="info-label">Fingerprint</div><div class="info-value code">{escape_html(snapshot.get("fingerprint","chrome"))}</div></div><div class="info-item"><div class="info-label">IP Limit</div><div class="info-value">{escape_html(ip_limit)}</div></div><div class="info-item"><div class="info-label">Connection Limit</div><div class="info-value">{escape_html(connection_limit)}</div></div><div class="info-item"><div class="info-label">Speed Limit</div><div class="info-value">{escape_html(speed_limit)}</div></div><div class="info-item"><div class="info-label">تاریخ انقضا</div><div class="info-value">{escape_html(expiry_display)}</div></div></div></section>
+  <!-- Hero -->
+  <section class="rounded-[26px] sm:rounded-[28px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6 md:p-8">
+    <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-5">
+      <div class="flex items-center gap-4">
+        <div class="w-13 h-13 sm:w-14 sm:h-14 shrink-0 rounded-2xl grid place-items-center bg-gradient-to-br from-blue-400/20 to-purple-400/10 border border-blue-400/25 text-blue-300">
+          <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 4v6c0 5.2-3.4 9-8 10-4.6-1-8-4.8-8-10V6l8-4z"/><path d="M9.5 12l1.8 1.8L15 10"/></svg>
+        </div>
+        <div class="min-w-0">
+          <h1 class="text-lg sm:text-xl md:text-2xl font-black tracking-tight truncate">{label_escaped}</h1>
+          <p class="mt-1.5 text-[10.5px] sm:text-[11px] text-white/40 break-all">UUID: {uid_escaped} &nbsp;·&nbsp; PXpanel {app_version_str}</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-2.5 self-start md:self-auto flex-wrap">
+        <button type="button" onclick="openQrModal()" class="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-full text-xs font-extrabold text-purple-300 border border-purple-400/30 bg-purple-400/10 hover:bg-purple-400/20 transition-colors">
+          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+          QR Code
+        </button>
+        <div class="inline-flex items-center gap-2 px-4 py-2 rounded-full text-xs font-extrabold {status_badge_html}">
+          <span class="status-dot w-2 h-2 rounded-full bg-current"></span>
+          {status_text}
+        </div>
+      </div>
+    </div>
+  </section>
 
-<section class="section"><div class="section-head"><div class="section-title">لینک‌های سرویس</div><div class="section-sub">Copy / Import</div></div><div class="link-card"><div class="link-main"><div class="link-name">VLESS</div><div class="link-url">{escape_html(vless_url)}</div></div><div class="copy-hint">VLESS</div></div><div class="link-card"><div class="link-main"><div class="link-name">SUBSCRIPTION</div><div class="link-url">{escape_html(sub_url)}</div></div><div class="copy-hint">SUB</div></div></section>
+  <!-- Usage overview -->
+  <section class="grid grid-cols-1 lg:grid-cols-[1.6fr_1fr] gap-5 sm:gap-6">
 
-<section class="section"><div class="section-head"><div class="section-title">دانلود برنامه‌ها</div><div class="section-sub">Official Releases</div></div><div class="downloads"><a class="download" href="https://github.com/2dust/v2rayNG/releases/latest" target="_blank" rel="noopener noreferrer"><div class="app-icon">NG</div><div><strong>v2rayNG</strong><span>Android</span></div></a><a class="download" href="https://github.com/2dust/v2rayN/releases/latest" target="_blank" rel="noopener noreferrer"><div class="app-icon">N</div><div><strong>v2rayN</strong><span>Windows / macOS / Linux</span></div></a><a class="download" href="https://github.com/hiddify/hiddify-app/releases/latest" target="_blank" rel="noopener noreferrer"><div class="app-icon">H</div><div><strong>Hiddify</strong><span>Android / Windows / macOS / Linux</span></div></a></div></section>
+    <div class="rounded-[22px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6 md:p-7">
+      <div class="flex items-center gap-2.5">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="text-white/35"><path d="M3 3v18h18"/><path d="M7 15l4-6 3 3 4-7"/></svg>
+        <div>
+          <p class="text-[10px] font-extrabold tracking-widest uppercase text-white/30">Traffic Overview</p>
+          <p class="mt-0.5 text-sm font-black">مصرف سرویس</p>
+        </div>
+      </div>
 
-<div class="channel">پشتیبانی و اطلاعیه‌ها · <b>کانال تلگرام: logic_sec</b></div>
-</div></div></div>
-</body></html>"""
+      <div class="mt-6 flex flex-col sm:flex-row items-center sm:items-start gap-6">
+        <div class="relative shrink-0 w-[128px] h-[128px]">
+          <svg width="128" height="128" viewBox="0 0 132 132" class="-rotate-90">
+            <circle cx="66" cy="66" r="54" fill="none" stroke="rgba(255,255,255,0.07)" stroke-width="10"/>
+            <circle cx="66" cy="66" r="54" fill="none" stroke="url(#usageRingGradient)" stroke-width="10" stroke-linecap="round"
+              stroke-dasharray="339.29" stroke-dashoffset="{dash_calc_offset}"/>
+            <defs>
+              <linearGradient id="usageRingGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#34d399"/>
+                <stop offset="100%" stop-color="#f59e0b"/>
+              </linearGradient>
+            </defs>
+          </svg>
+          <div class="absolute inset-0 grid place-items-center">
+            <div class="text-center">
+              <p class="text-xl font-black leading-none">{usage_percent}%</p>
+              <p class="mt-1.5 text-[10px] text-white/40">مصرف‌شده</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex-1 w-full min-w-0">
+          <div class="text-xl sm:text-2xl font-black tracking-tight">
+            {used_bytes_str}
+            <span class="text-sm font-semibold text-white/40"> / {limit_bytes_str}</span>
+          </div>
+
+          <div class="mt-4 rounded-xl border border-white/[0.05] sub-box px-3 pt-3 pb-1.5">
+            <p class="flex items-center gap-1.5 text-[10px] text-white/35 mb-1">
+              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M17 7h4v4"/></svg>
+              روند مصرف
+            </p>
+            <svg viewBox="0 0 300 64" class="w-full h-14" preserveAspectRatio="none">
+              <defs>
+                <linearGradient id="trendFill" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#60a5fa" stop-opacity="0.35"/>
+                  <stop offset="100%" stop-color="#60a5fa" stop-opacity="0"/>
+                </linearGradient>
+              </defs>
+              <path d="M0,64 L{svg_points} L300,64 Z" fill="url(#trendFill)"/>
+              <path d="M{svg_points}" fill="none" stroke="#60a5fa" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+
+          <div class="mt-4 flex items-center justify-between text-[11px] text-white/40 flex-wrap gap-2">
+            <span class="inline-flex items-center gap-1.5">
+              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
+              باقی‌مانده: <b class="text-white/70 font-bold">{remaining_value_escaped}</b>
+            </span>
+            <span class="inline-flex items-center gap-1.5">
+              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 3v3M16 3v3"/></svg>
+              زمان: <b class="text-white/70 font-bold">{expiry_remaining_escaped}</b>
+            </span>
+
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="rounded-[22px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6 md:p-7">
+      <div class="flex items-center gap-2.5">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="text-white/35"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/></svg>
+        <p class="text-[10px] font-extrabold tracking-widest uppercase text-white/30">Service</p>
+      </div>
+      <div class="mt-4 divide-y divide-white/[0.06]">
+        <div class="flex items-center justify-between py-3 first:pt-0">
+          <span class="inline-flex items-center gap-2 text-[11px] text-white/45">
+            <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 3v3M16 3v3"/></svg>
+            انقضا
+          </span>
+          <span class="text-xs font-extrabold">{expiry_display_escaped}</span>
+        </div>
+        <div class="flex items-center justify-between py-3">
+          <span class="inline-flex items-center gap-2 text-[11px] text-white/45">
+            <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.55a11 11 0 0 1 14 0"/><path d="M8.5 16a6 6 0 0 1 7 0"/><path d="M12 20h.01"/></svg>
+            IP Limit
+          </span>
+          <span class="text-xs font-extrabold">{ip_limit_escaped}</span>
+        </div>
+        <div class="flex items-center justify-between py-3">
+          <span class="inline-flex items-center gap-2 text-[11px] text-white/45">
+            <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V7a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v2"/><rect x="2" y="9" width="20" height="8" rx="2"/><path d="M6 17v2M18 17v2"/></svg>
+            Connection
+          </span>
+          <span class="text-xs font-extrabold">{connection_limit_escaped}</span>
+        </div>
+        <div class="flex items-center justify-between py-3 last:pb-0">
+          <span class="inline-flex items-center gap-2 text-[11px] text-white/45">
+            <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>
+            Speed
+          </span>
+          <span class="text-xs font-extrabold">{speed_limit_escaped}</span>
+        </div>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- Stats -->
+  <section class="grid grid-cols-2 md:grid-cols-4 gap-3.5 sm:gap-4 md:gap-5">
+
+    <div class="rounded-2xl border dynamic-card backdrop-blur-xl p-4 sm:p-5 hover:border-emerald-400/20 transition-colors duration-200">
+      <div class="w-9 h-9 rounded-xl grid place-items-center bg-emerald-400/10 border border-emerald-400/20 text-emerald-300">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M18 9l-5 5-3-3-4 4"/></svg>
+      </div>
+      <p class="mt-4 text-[11px] text-white/45">مصرف فعلی</p>
+      <p class="mt-1 text-[14px] sm:text-[15px] font-black text-emerald-300 break-words">{used_bytes_str}</p>
+    </div>
+
+    <div class="rounded-2xl border dynamic-card backdrop-blur-xl p-4 sm:p-5 hover:border-amber-400/20 transition-colors duration-200">
+      <div class="w-9 h-9 rounded-xl grid place-items-center bg-amber-400/10 border border-amber-400/20 text-amber-300">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
+      </div>
+      <p class="mt-4 text-[11px] text-white/45">باقی‌مانده</p>
+      <p class="mt-1 text-[14px] sm:text-[15px] font-black text-amber-300 break-words">{remaining_value_escaped}</p>
+    </div>
+
+    <div class="rounded-2xl border dynamic-card backdrop-blur-xl p-4 sm:p-5 hover:border-blue-400/20 transition-colors duration-200">
+      <div class="w-9 h-9 rounded-xl grid place-items-center bg-blue-400/10 border border-blue-400/20 text-blue-300">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 4v16M4 9h16"/></svg>
+      </div>
+      <p class="mt-4 text-[11px] text-white/45">اتصالات فعال</p>
+      <p class="mt-1 text-[14px] sm:text-[15px] font-black text-blue-300 break-words">{len(unique_ips_for_uuid(uid))}</p>
+    </div>
+
+    <div class="rounded-2xl border dynamic-card backdrop-blur-xl p-4 sm:p-5 hover:border-purple-400/20 transition-colors duration-200">
+      <div class="w-9 h-9 rounded-xl grid place-items-center bg-purple-400/10 border border-purple-400/20 text-purple-300">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l9 4.5v6c0 5-3.6 8.7-9 9.5-5.4-.8-9-4.5-9-9.5v-6L12 2z"/></svg>
+      </div>
+      <p class="mt-4 text-[11px] text-white/45">زمان باقی‌مانده</p>
+      <p class="mt-1 text-[14px] sm:text-[15px] font-black text-purple-300 break-words">{expiry_remaining_escaped}</p>
+    </div>
+
+  </section>
+
+  <!-- Technical details -->
+  <section class="rounded-[22px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6 md:p-7">
+    <div class="flex items-center justify-between gap-3 mb-5">
+      <p class="flex items-center gap-2 text-sm font-black">
+        <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="text-white/40"><path d="M4 21v-7M4 10V3M12 21v-11M12 6V3M20 21v-5M20 12V3"/><path d="M1 14h6M9 8h6M17 16h6"/></svg>
+        جزئیات فنی
+      </p>
+      <p class="text-[11px] text-white/40">Configuration Details</p>
+    </div>
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+      <div class="rounded-2xl border border-white/[0.06] sub-box p-4">
+        <p class="text-[11px] text-white/45">Protocol</p>
+        <p class="mt-2 text-[11px] font-medium text-purple-300 tracking-wide" dir="ltr" style="font-family:ui-monospace,Consolas,monospace">{protocol_escaped}</p>
+      </div>
+      <div class="rounded-2xl border border-white/[0.06] sub-box p-4">
+        <p class="text-[11px] text-white/45">Fingerprint</p>
+        <p class="mt-2 text-[11px] font-medium text-purple-300 tracking-wide" dir="ltr" style="font-family:ui-monospace,Consolas,monospace">{fingerprint_escaped}</p>
+      </div>
+      <div class="rounded-2xl border border-white/[0.06] sub-box p-4">
+        <p class="text-[11px] text-white/45">IP Limit</p>
+        <p class="mt-2 text-xs font-bold text-white/85">{ip_limit_escaped}</p>
+      </div>
+      <div class="rounded-2xl border border-white/[0.06] sub-box p-4">
+        <p class="text-[11px] text-white/45">Connection Limit</p>
+        <p class="mt-2 text-xs font-bold text-white/85">{connection_limit_escaped}</p>
+      </div>
+      <div class="rounded-2xl border border-white/[0.06] sub-box p-4">
+        <p class="text-[11px] text-white/45">Speed Limit</p>
+        <p class="mt-2 text-xs font-bold text-white/85">{speed_limit_escaped}</p>
+      </div>
+      <div class="rounded-2xl border border-white/[0.06] sub-box p-4">
+        <p class="text-[11px] text-white/45">تاریخ انقضا</p>
+        <p class="mt-2 text-xs font-bold text-white/85">{expiry_display_escaped}</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Links -->
+  <section class="rounded-[22px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6 md:p-7">
+    <div class="flex items-center justify-between gap-3 mb-5">
+      <p class="flex items-center gap-2 text-sm font-black">
+        <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="text-white/40"><path d="M10 13a5 5 0 0 0 7.07 0l2.83-2.83a5 5 0 0 0-7.07-7.07L11.5 4.5"/><path d="M14 11a5 5 0 0 0-7.07 0l-2.83 2.83a5 5 0 0 0 7.07 7.07l1.41-1.41"/></svg>
+        لینک‌های سرویس
+      </p>
+      <p class="text-[11px] text-white/40">Copy / Import</p>
+    </div>
+
+    <div class="space-y-3">
+      <div class="flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-4 rounded-2xl border border-white/[0.06] sub-box p-4 hover:border-purple-400/25 transition-colors duration-200">
+        <div class="min-w-0 flex-1">
+          <p class="text-[11px] font-extrabold text-white/45 tracking-wide">VLESS</p>
+          <p id="vlessLinkText" class="mt-1.5 text-[11px] text-purple-300 break-all leading-6" dir="ltr" style="font-family:ui-monospace,Consolas,monospace">{vless_url_escaped}</p>
+        </div>
+        <button id="vlessCopyBtn" type="button" onclick="pxCopy('vlessLinkText','vlessCopyBtn')"
+          class="copy-btn shrink-0 self-start sm:self-center inline-flex items-center gap-1.5 text-[11px] font-bold text-white/60 px-3.5 py-2 rounded-xl bg-white/[0.05] border border-white/10 hover:bg-white/[0.1] hover:text-white transition-colors duration-200">
+          <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+          <span>کپی</span>
+        </button>
+      </div>
+
+      <div class="flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-4 rounded-2xl border border-white/[0.06] sub-box p-4 hover:border-purple-400/25 transition-colors duration-200">
+        <div class="min-w-0 flex-1">
+          <p class="text-[11px] font-extrabold text-white/45 tracking-wide">SUBSCRIPTION</p>
+          <p id="subLinkText" class="mt-1.5 text-[11px] text-purple-300 break-all leading-6" dir="ltr" style="font-family:ui-monospace,Consolas,monospace">{sub_url_escaped}</p>
+        </div>
+        <button id="subCopyBtn" type="button" onclick="pxCopy('subLinkText','subCopyBtn')"
+          class="copy-btn shrink-0 self-start sm:self-center inline-flex items-center gap-1.5 text-[11px] font-bold text-white/60 px-3.5 py-2 rounded-xl bg-white/[0.05] border border-white/10 hover:bg-white/[0.1] hover:text-white transition-colors duration-200">
+          <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+          <span>کپی</span>
+        </button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Downloads -->
+  <section class="rounded-[22px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6 md:p-7">
+    <div class="flex items-center justify-between gap-3 mb-5">
+      <p class="flex items-center gap-2 text-sm font-black">
+        <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="text-white/40"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
+        دانلود برنامه‌ها
+      </p>
+      <p class="text-[11px] text-white/40">Official Releases</p>
+    </div>
+
+    <div class="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
+      <a href="https://github.com/2dust/v2rayNG/releases/latest" target="_blank" rel="noopener noreferrer"
+         class="flex items-center gap-3 rounded-2xl border border-white/10 sub-box p-4 hover:border-blue-400/25 transition-colors duration-200">
+        <div class="w-10 h-10 shrink-0 rounded-xl grid place-items-center bg-blue-400/10 border border-blue-400/20 text-blue-300 font-black text-[11px]">NG</div>
+        <div class="min-w-0">
+          <p class="text-xs font-extrabold">v2rayNG</p>
+          <p class="mt-0.5 text-[10px] text-white/40">Android</p>
+        </div>
+      </a>
+      <a href="https://github.com/2dust/v2rayN/releases/latest" target="_blank" rel="noopener noreferrer"
+         class="flex items-center gap-3 rounded-2xl border border-white/10 sub-box p-4 hover:border-blue-400/25 transition-colors duration-200">
+        <div class="w-10 h-10 shrink-0 rounded-xl grid place-items-center bg-blue-400/10 border border-blue-400/20 text-blue-300 font-black text-[11px]">N</div>
+        <div class="min-w-0">
+          <p class="text-xs font-extrabold">v2rayN</p>
+          <p class="mt-0.5 text-[10px] text-white/40">Windows / macOS / Linux</p>
+        </div>
+      </a>
+      <a href="https://github.com/hiddify/hiddify-app/releases/latest" target="_blank" rel="noopener noreferrer"
+         class="flex items-center gap-3 rounded-2xl border border-white/10 sub-box p-4 hover:border-blue-400/25 transition-colors duration-200">
+        <div class="w-10 h-10 shrink-0 rounded-xl grid place-items-center bg-blue-400/10 border border-blue-400/20 text-blue-300 font-black text-[11px]">H</div>
+        <div class="min-w-0">
+          <p class="text-xs font-extrabold">Hiddify</p>
+          <p class="mt-0.5 text-[10px] text-white/40">Android / Windows / macOS / Linux</p>
+        </div>
+      </a>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <div class="rounded-2xl border border-emerald-400/15 bg-emerald-400/[0.05] p-4 text-center text-xs text-white/45">
+    پشتیبانی و اطلاعیه‌ها &nbsp;·&nbsp; <b class="text-emerald-300">کانال تلگرام: logic_sec</b>
+  </div>
+
+</div>
+
+<!-- QR Code Modal Popup -->
+<div id="qrModal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md hidden">
+  <div class="w-full max-w-sm rounded-[24px] border border-white/15 bg-[#0b0c14] p-6 text-center shadow-2xl relative">
+    <button type="button" onclick="closeQrModal()" class="absolute top-4 left-4 w-8 h-8 rounded-full bg-white/5 border border-white/10 grid place-items-center text-white/60 hover:text-white">✕</button>
+    <p class="text-sm font-black text-white/90 mb-2">QR Code اسکن کانفیگ</p>
+    <p class="text-[11px] text-white/40 mb-4">برای اتصال سریع با گوشی موبایل</p>
+    <div id="qrcodeContainer" class="bg-white p-4 rounded-2xl inline-block mx-auto mb-4 border border-white/10"></div>
+    <p id="qrModalText" class="text-[10px] text-purple-300 break-all max-h-16 overflow-y-auto px-2" dir="ltr"></p>
+  </div>
+</div>
+
+<script>
+const vlessUrlData = "{vless_url}";
+
+// Theme toggle logic with localStorage support (2 themes total)
+function toggleTheme() {{
+  const body = document.body;
+  body.classList.toggle('theme-lighter');
+  const isLighter = body.classList.contains('theme-lighter');
+  localStorage.setItem('px_theme', isLighter ? 'lighter' : 'dark');
+}}
+
+// Initialize saved theme on load
+(function() {{
+  if (localStorage.getItem('px_theme') === 'lighter') {{
+    document.body.classList.add('theme-lighter');
+  }}
+}})();
+
+function openQrModal() {{
+  var modal = document.getElementById('qrModal');
+  var container = document.getElementById('qrcodeContainer');
+  var txtEl = document.getElementById('qrModalText');
+  container.innerHTML = "";
+  txtEl.textContent = vlessUrlData;
+  modal.classList.remove('hidden');
+  try {{
+    var typeNumber = 0;
+    var errorCorrectionLevel = 'L';
+    var qr = qrcode(typeNumber, errorCorrectionLevel);
+    qr.addData(vlessUrlData);
+    qr.make();
+    container.innerHTML = qr.createImgTag(5, 8);
+  }} catch (e) {{
+    container.innerHTML = "<p class='text-xs text-black'>خطا در تولید QR Code</p>";
+  }}
+}}
+
+function closeQrModal() {{
+  document.getElementById('qrModal').classList.add('hidden');
+}}
+
+document.getElementById('qrModal').addEventListener('click', function(e) {{
+  if (e.target === this) closeQrModal();
+}});
+
+function pxCopy(textId, btnId) {{
+  var el = document.getElementById(textId);
+  var btn = document.getElementById(btnId);
+  if (!el || !btn) return;
+  var text = el.textContent.textContext || el.textContent.trim();
+  var done = function() {{
+    var original = btn.getAttribute('data-original');
+    if (!original) {{
+      original = btn.innerHTML;
+      btn.setAttribute('data-original', original);
+    }}
+    btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span>کپی شد</span>';
+    btn.classList.add('text-emerald-300','border-emerald-400/30','bg-emerald-400/10');
+    setTimeout(function() {{
+      btn.innerHTML = original;
+      btn.classList.remove('text-emerald-300','border-emerald-400/30','bg-emerald-400/10');
+    }}, 1700);
+  }};
+  if (navigator.clipboard && navigator.clipboard.writeText) {{
+    navigator.clipboard.writeText(text).then(done).catch(function() {{ fallbackCopy(text, done); }});
+  }} else {{
+    fallbackCopy(text, done);
+  }}
+}}
+function fallbackCopy(text, cb) {{
+  var ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try {{ document.execCommand('copy'); }} catch (e) {{}}
+  document.body.removeChild(ta);
+  if (cb) cb();
+}}
+</script>
+</body>
+</html>"""
     return HTMLResponse(info_html)
-
-
 # ============================================================
 # SUB GROUP API
 # ============================================================
@@ -4510,7 +4900,7 @@ content="width=device-width,initial-scale=1"
 >
 
 <title>
-PXpanel
+PX Panel
 </title>
 
 <style>
@@ -4536,7 +4926,7 @@ body{
     background:
         radial-gradient(
             circle at top right,
-            rgba(99,102,241,.17),
+            rgba(37,99,235,.17),
             transparent 30%
         ),
         #07070a;
@@ -4576,7 +4966,7 @@ h1{
 
     background:rgba(0,0,0,.22);
 
-    color:#c4b5fd;
+    color:#93c5fd;
 
     direction:ltr;
     word-break:break-all;
@@ -4588,12 +4978,12 @@ h1{
     display:inline-block;
     margin-top:18px;
 
-    color:#a78bfa;
+    color:#60a5fa;
     text-decoration:none;
 }
 
 .version{
-    color:#a78bfa;
+    color:#60a5fa;
     font-size:11px;
 }
 
@@ -4605,11 +4995,11 @@ h1{
 <div class="card">
 
 <h1>
-PXpanel
+PX Panel
 </h1>
 
 <div class="version">
-12.1.0 Beta
+13.6.1
 </div>
 
 <div class="text">
@@ -4928,6 +5318,162 @@ async def public_sub_data(
             links_out,
     }
 
+
+
+
+@app.post("/api/mix-sub")
+async def mix_subscription(request: Request, _=Depends(require_auth)):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON نامعتبر")
+    ids = body.get("link_ids") or []
+    if not isinstance(ids, list) or len(ids) < 2:
+        raise HTTPException(status_code=400, detail="حداقل ۲ کانفیگ انتخاب کنید")
+    if len(ids) > 40:
+        raise HTTPException(status_code=400, detail="حداکثر ۴۰ کانفیگ")
+    host = get_host(request)
+    lines = []
+    used_names = set()
+    total_used = 0
+    total_limit = 0
+    labels = []
+    async with LINKS_LOCK:
+        for lid in ids:
+            link = LINKS.get(lid)
+            if not link or not is_link_allowed(link):
+                continue
+            labels.append(str(link.get("label") or lid[:8]))
+            total_used += int(link.get("used_bytes", 0) or 0)
+            total_limit += int(link.get("limit_bytes", 0) or 0)
+            name = random_config_name(used_names)
+            used_names.add(name)
+            lines.append(generate_vless_link(
+                lid, host, remark=name,
+                protocol=link.get("protocol", DEFAULT_PROTOCOL),
+                fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT),
+                alpn=link.get("alpn"),
+                port=link.get("port", DEFAULT_PORT),
+            ))
+    if not lines:
+        raise HTTPException(status_code=400, detail="هیچ کانفیگ معتبری انتخاب نشده")
+    # stats first line
+    vol = f"{fmt_bytes(total_used)}/{fmt_bytes(total_limit)}" if total_limit > 0 else f"{fmt_bytes(total_used)}/∞"
+    mix_label = "Mix-" + random_config_name()[:6]
+    stats = f"{mix_label} | {vol} | {len(lines)} configs"
+    first = generate_vless_link(ids[0], "127.0.0.1", remark=stats, protocol="vless-ws")
+    content = base64.b64encode(("\n".join([first] + lines)).encode()).decode()
+    # store as a sub group for reuse
+    sub_id, sub = await create_sub_group(name=mix_label, desc="مخلوط‌سازی کانفیگ‌ها")
+    async with SUBS_LOCK:
+        if sub_id in SUBS:
+            SUBS[sub_id]["link_ids"] = list(ids)
+    await save_state()
+    return {
+        "ok": True,
+        "sub_url": f"https://{host}/sub-group/{sub['uuid_key']}",
+        "name": mix_label,
+        "count": len(lines),
+        "content_preview": stats,
+    }
+
+
+@app.get("/api/categories")
+async def list_categories(_=Depends(require_auth)):
+    items = [{**cat, "id": cid} for cid, cat in CATEGORIES.items()]
+    items.sort(key=lambda x: int(x.get("number", 0)))
+    return {"categories": items}
+
+@app.post("/api/categories")
+async def create_category(request: Request, _=Depends(require_auth)):
+    if len(CATEGORIES) >= 10:
+        raise HTTPException(status_code=400, detail="حداکثر ۱۰ دسته‌بندی")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON نامعتبر")
+    name = str(body.get("name") or "دسته جدید").strip()[:40]
+    used = {int(x.get("number", 0)) for x in CATEGORIES.values()}
+    num = 0
+    while num in used:
+        num += 1
+    cid = str(num)
+    limit_value = safe_float(body.get("limit_value", 0))
+    limit_unit = str(body.get("limit_unit") or "GB").upper()
+    limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
+    speed_value = safe_float(body.get("speed_limit_value", 0))
+    speed_bytes = 0 if speed_value <= 0 else parse_speed_to_bytes(speed_value, "MBIT")
+    raw_clean = body.get("clean_ips") or ""
+    if isinstance(raw_clean, list):
+        clean_ips = [str(x).strip() for x in raw_clean if str(x).strip()]
+    else:
+        clean_ips = [x.strip() for x in str(raw_clean).replace(",", "\n").splitlines() if x.strip()]
+    record = {
+        "id": cid, "name": name, "number": num,
+        "limit_bytes": limit_bytes,
+        "expires_days": safe_int(body.get("expires_days", 0), minimum=0),
+        "connection_limit": safe_int(body.get("connection_limit", 0), minimum=0),
+        "speed_limit_bytes": speed_bytes,
+        "ip_limit": safe_int(body.get("ip_limit", 0), minimum=0),
+        "clean_ips": clean_ips,
+        "random_name": bool(body.get("random_name", False)),
+        "single_user": bool(body.get("single_user", False)),
+        "created_at": datetime.now().isoformat(),
+    }
+    CATEGORIES[cid] = record
+    await save_state()
+    return {"ok": True, **record}
+
+
+@app.patch("/api/categories/{cid}")
+async def update_category(cid: str, request: Request, _=Depends(require_auth)):
+    if cid not in CATEGORIES:
+        raise HTTPException(status_code=404, detail="یافت نشد")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON نامعتبر")
+    cat = CATEGORIES[cid]
+    if "name" in body:
+        cat["name"] = str(body.get("name") or cat["name"]).strip()[:40]
+    if "limit_value" in body:
+        lv = safe_float(body.get("limit_value", 0))
+        unit = str(body.get("limit_unit") or "GB").upper()
+        cat["limit_bytes"] = 0 if lv <= 0 else parse_size_to_bytes(lv, unit)
+    if "expires_days" in body:
+        cat["expires_days"] = safe_int(body.get("expires_days", 0), minimum=0)
+    if "connection_limit" in body:
+        cat["connection_limit"] = safe_int(body.get("connection_limit", 0), minimum=0)
+    if "speed_limit_value" in body:
+        sv = safe_float(body.get("speed_limit_value", 0))
+        cat["speed_limit_bytes"] = 0 if sv <= 0 else parse_speed_to_bytes(sv, "MBIT")
+    if "ip_limit" in body:
+        cat["ip_limit"] = safe_int(body.get("ip_limit", 0), minimum=0)
+    if "clean_ips" in body:
+        raw = body.get("clean_ips") or ""
+        if isinstance(raw, list):
+            cat["clean_ips"] = [str(x).strip() for x in raw if str(x).strip()]
+        else:
+            cat["clean_ips"] = [x.strip() for x in str(raw).replace(",", "\n").splitlines() if x.strip()]
+    if "random_name" in body:
+        cat["random_name"] = bool(body.get("random_name"))
+    if "single_user" in body:
+        cat["single_user"] = bool(body.get("single_user"))
+    await save_state()
+    return {"ok": True, **cat}
+
+@app.delete("/api/categories/{cid}")
+async def delete_category(cid: str, _=Depends(require_auth)):
+    if cid in ("0", "1"):
+        raise HTTPException(status_code=400, detail="پیش‌فرض قابل حذف نیست")
+    if cid not in CATEGORIES:
+        raise HTTPException(status_code=404, detail="یافت نشد")
+    del CATEGORIES[cid]
+    for link in LINKS.values():
+        if str(link.get("category_id")) == cid:
+            link["category_id"] = "0"
+    await save_state()
+    return {"ok": True}
 
 # ============================================================
 # STATS
@@ -5448,7 +5994,7 @@ content="width=device-width,initial-scale=1"
 />
 
 <title>
-PXpanel 12.1.0 Beta
+PX Panel 13.6.1
 </title>
 
 <link
@@ -5478,6 +6024,12 @@ body{
     margin:0;
     min-height:100%;
 }
+*::-webkit-scrollbar{width:6px;height:6px}
+*::-webkit-scrollbar-track{background:transparent}
+*::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:99px}
+*::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.2)}
+*{scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.12) transparent}
+
 
 body{
     min-height:100vh;
@@ -5489,12 +6041,12 @@ body{
     background:
         radial-gradient(
             circle at 10% 0%,
-            rgba(99,102,241,.13),
+            rgba(37,99,235,.13),
             transparent 25%
         ),
         radial-gradient(
             circle at 100% 100%,
-            rgba(139,92,246,.10),
+            rgba(59,130,246,.10),
             transparent 25%
         ),
         #07070a;
@@ -5540,8 +6092,8 @@ body{
     background:
         linear-gradient(
             135deg,
-            #6366f1,
-            #8b5cf6
+            #2563eb,
+            #3b82f6
         );
 }
 
@@ -5557,7 +6109,7 @@ body{
 }
 
 .brand-version{
-    color:#a78bfa;
+    color:#60a5fa;
     font-size:9px;
     margin-top:2px;
 }
@@ -5589,8 +6141,8 @@ body{
     background:
         linear-gradient(
             135deg,
-            #6366f1,
-            #8b5cf6
+            #2563eb,
+            #3b82f6
         );
 }
 
@@ -5631,8 +6183,8 @@ body{
     font-size:19px;
     font-weight:900;
 }
-.stat::after{content:"";position:absolute;right:0;bottom:0;left:0;height:2px;background:var(--stat-color,#818cf8);opacity:.8}
-.stat:nth-child(1){--stat-color:#60a5fa}.stat:nth-child(2){--stat-color:#4ade80}.stat:nth-child(3){--stat-color:#f59e0b}.stat:nth-child(4){--stat-color:#a78bfa}.stat:nth-child(5){--stat-color:#fb7185}.stat:nth-child(6){--stat-color:#22d3ee}.stat-value{color:var(--stat-color,#fff)}
+.stat::after{content:"";position:absolute;right:0;bottom:0;left:0;height:2px;background:var(--stat-color,#60a5fa);opacity:.8}
+.stat:nth-child(1){--stat-color:#60a5fa}.stat:nth-child(2){--stat-color:#4ade80}.stat:nth-child(3){--stat-color:#f59e0b}.stat:nth-child(4){--stat-color:#60a5fa}.stat:nth-child(5){--stat-color:#fb7185}.stat:nth-child(6){--stat-color:#22d3ee}.stat-value{color:var(--stat-color,#fff)}
 
 
 .panel{
@@ -5752,7 +6304,7 @@ th{
 
 .action.primary{
     background:
-        rgba(99,102,241,.18);
+        rgba(37,99,235,.18);
 }
 
 .action.danger{
@@ -5769,7 +6321,7 @@ th{
     overflow:hidden;
     text-overflow:ellipsis;
 
-    color:#c4b5fd;
+    color:#93c5fd;
 
     font-family:Consolas,monospace;
 
@@ -5843,11 +6395,11 @@ th{
     border-radius:13px;
 
     background:
-        rgba(99,102,241,.06);
+        rgba(37,99,235,.06);
 
     border:
         1px solid
-        rgba(99,102,241,.13);
+        rgba(37,99,235,.13);
 
     color:rgba(255,255,255,.62);
 
@@ -5857,7 +6409,7 @@ th{
 }
 
 .notice strong{
-    color:#c4b5fd;
+    color:#93c5fd;
 }
 
 .empty{
@@ -6005,7 +6557,7 @@ th{
 .field select:focus,
 .field textarea:focus{
     border-color:
-        rgba(99,102,241,.55);
+        rgba(37,99,235,.55);
 }
 
 .modal-actions{
@@ -6036,8 +6588,8 @@ th{
     background:
         linear-gradient(
             135deg,
-            #6366f1,
-            #8b5cf6
+            #2563eb,
+            #3b82f6
         );
 }
 
@@ -6091,7 +6643,7 @@ th{
 /* LOGIN NOTICE START — DELETE THIS WHOLE BLOCK TO DISABLE THE LOGIN NOTICE */
 .login-notice-backdrop{position:fixed;inset:0;z-index:500;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,.72);backdrop-filter:blur(14px)}
 .login-notice{width:min(620px,100%);max-height:calc(100vh - 32px);overflow:auto;padding:22px;border:1px solid rgba(255,255,255,.10);border-radius:24px;background:linear-gradient(180deg,rgba(24,24,34,.98),rgba(12,12,17,.98));box-shadow:0 30px 100px rgba(0,0,0,.60);animation:noticeIn .28s ease both}
-.login-notice-head{display:flex;align-items:center;gap:12px;margin-bottom:16px}.login-notice-icon{width:42px;height:42px;display:flex;align-items:center;justify-content:center;border-radius:13px;background:rgba(99,102,241,.14);border:1px solid rgba(129,140,248,.22);color:#a5b4fc;font-size:18px}.login-notice h3{margin:0;font-size:15px}.login-notice p{margin:5px 0 0;color:rgba(255,255,255,.42);font-size:9px;line-height:1.9}.notice-downloads{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px}.notice-download{display:block;padding:12px;border-radius:14px;text-decoration:none;color:#fff;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.07);transition:.2s ease}.notice-download:hover{transform:translateY(-2px);border-color:rgba(129,140,248,.30);background:rgba(129,140,248,.07)}.notice-download strong{display:block;font-size:10px}.notice-download span{display:block;margin-top:3px;color:rgba(255,255,255,.36);font-size:8px}.login-notice-body{margin-top:14px;padding:14px;border-radius:14px;background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);color:rgba(255,255,255,.62);font-size:10px;line-height:2}.login-notice-body b{color:#fff}.login-notice-actions{margin-top:14px;display:flex;gap:8px}.login-notice-actions button{flex:1;padding:11px;border:0;border-radius:12px;color:#fff;background:linear-gradient(135deg,#6366f1,#8b5cf6);font-family:inherit;cursor:pointer}@keyframes noticeIn{from{opacity:0;transform:translateY(16px) scale(.985)}to{opacity:1;transform:translateY(0) scale(1)}}
+.login-notice-head{display:flex;align-items:center;gap:12px;margin-bottom:16px}.login-notice-icon{width:42px;height:42px;display:flex;align-items:center;justify-content:center;border-radius:13px;background:rgba(37,99,235,.14);border:1px solid rgba(129,140,248,.22);color:#93c5fd;font-size:18px}.login-notice h3{margin:0;font-size:15px}.login-notice p{margin:5px 0 0;color:rgba(255,255,255,.42);font-size:9px;line-height:1.9}.notice-downloads{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px}.notice-download{display:block;padding:12px;border-radius:14px;text-decoration:none;color:#fff;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.07);transition:.2s ease}.notice-download:hover{transform:translateY(-2px);border-color:rgba(129,140,248,.30);background:rgba(129,140,248,.07)}.notice-download strong{display:block;font-size:10px}.notice-download span{display:block;margin-top:3px;color:rgba(255,255,255,.36);font-size:8px}.login-notice-body{margin-top:14px;padding:14px;border-radius:14px;background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);color:rgba(255,255,255,.62);font-size:10px;line-height:2}.login-notice-body b{color:#fff}.login-notice-actions{margin-top:14px;display:flex;gap:8px}.login-notice-actions button{flex:1;padding:11px;border:0;border-radius:12px;color:#fff;background:linear-gradient(135deg,#2563eb,#3b82f6);font-family:inherit;cursor:pointer}@keyframes noticeIn{from{opacity:0;transform:translateY(16px) scale(.985)}to{opacity:1;transform:translateY(0) scale(1)}}
 /* LOGIN NOTICE END */
 
 /* REGION NOTICE + RESPONSIVE UI OVERRIDES */
@@ -6105,9 +6657,9 @@ th{
     max-height:min(760px,calc(100vh - 24px));
     padding:clamp(16px,3vw,24px);
     border-radius:24px;
-    border:1px solid rgba(167,139,250,.18);
+    border:1px solid rgba(96,165,250,.18);
     background:
-        radial-gradient(circle at 90% 0%,rgba(99,102,241,.13),transparent 32%),
+        radial-gradient(circle at 90% 0%,rgba(37,99,235,.13),transparent 32%),
         linear-gradient(180deg,rgba(25,25,37,.98),rgba(11,11,16,.99));
     box-shadow:0 35px 110px rgba(0,0,0,.62),inset 0 1px rgba(255,255,255,.04);
 }
@@ -6115,9 +6667,9 @@ th{
 .login-notice-icon{
     width:46px;height:46px;min-width:46px;border-radius:15px;
     display:flex;align-items:center;justify-content:center;
-    background:rgba(99,102,241,.12);
-    border:1px solid rgba(167,139,250,.22);
-    color:#c4b5fd;
+    background:rgba(37,99,235,.12);
+    border:1px solid rgba(96,165,250,.22);
+    color:#93c5fd;
 }
 .login-notice-icon svg{width:24px;height:24px;display:block}
 .login-notice h3{font-size:15px;letter-spacing:-.2px}
@@ -6126,7 +6678,7 @@ th{
     margin-top:12px;
     padding:15px;
     border-radius:16px;
-    background:rgba(99,102,241,.065);
+    background:rgba(37,99,235,.065);
     border:1px solid rgba(129,140,248,.14);
     color:rgba(255,255,255,.66);
     font-size:10px;
@@ -6247,15 +6799,16 @@ P
 <div>
 
 <div class="brand-name">
-PXpanel
+PX Panel
 </div>
 
 <div class="brand-desc">
 داشبورد مدیریت سرویس
 </div>
-
-<div class="brand-version">
-12.1.0 Beta
+<div class="brand-version">13.6.1</div>
+<div style="margin-top:5px;font-size:10px;display:flex;align-items:center;gap:6px">
+<svg width="14" height="14" viewBox="0 0 24 24" fill="#ff0000"><path d="M23.5 6.2a3 3 0 0 0-2.1-2.1C19.5 3.5 12 3.5 12 3.5s-7.5 0-9.4.6A3 3 0 0 0 .5 6.2 31.5 31.5 0 0 0 0 12a31.5 31.5 0 0 0 .5 5.8 3 3 0 0 0 2.1 2.1c1.9.6 9.4.6 9.4.6s7.5 0 9.4-.6a3 3 0 0 0 2.1-2.1A31.5 31.5 0 0 0 24 12a31.5 31.5 0 0 0-.5-5.8zM9.75 15.5v-7l6.5 3.5-6.5 3.5z"/></svg>
+<a href="https://www.youtube.com/@LogicSec_YT" target="_blank" rel="noopener" style="color:#93c5fd;text-decoration:none">LogicSec_YT</a>
 </div>
 
 </div>
@@ -6264,18 +6817,17 @@ PXpanel
 
 <div class="top-actions">
 
-<button
-class="top-btn primary"
-onclick="openAutoModal()"
-><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 5v14M5 12h14"/></svg>
-ساخت خودکار
+<button class="top-btn primary" onclick="openAutoModal()" title="ساخت خودکار" style="min-width:44px">
+<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="8" width="18" height="12" rx="2"/><circle cx="12" cy="14" r="2"/><path d="M8 8V6a4 4 0 0 1 8 0v2"/></svg>
 </button>
-
-<button
-class="top-btn"
-onclick="openManualModal()"
-><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 20h4L19 9l-4-4L4 16v4Z"/><path d="m13.5 6.5 4 4"/></svg>
-ساخت دستی
+<button class="top-btn" onclick="openManualModal()" title="ساخت دستی" style="min-width:44px">
+<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 5v14M5 12h14"/></svg>
+</button>
+<button class="top-btn" onclick="openCategoryModal()" title="دسته‌بندی" style="min-width:44px">
+<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 6h16M4 12h10M4 18h14"/></svg>
+</button>
+<button class="top-btn" onclick="openMixModal()" title="مخلوط‌سازی کانفیگ‌ها" style="min-width:44px;background:rgba(239,68,68,.18);border-color:rgba(239,68,68,.35);color:#fca5a5">
+<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg>
 </button>
 
 <button
@@ -6337,7 +6889,7 @@ class="stat-value"
 
 <div class="stat">
 <div class="stat-label">
-Traffic
+ترافیک مصرفی
 </div>
 <div
 id="traffic"
@@ -6349,7 +6901,7 @@ class="stat-value"
 
 <div class="stat">
 <div class="stat-label">
-Requests
+ریکویست
 </div>
 <div
 id="requests"
@@ -6361,7 +6913,7 @@ class="stat-value"
 
 <div class="stat">
 <div class="stat-label">
-Uptime
+تایم فعال بودن
 </div>
 <div
 id="uptime"
@@ -6381,11 +6933,14 @@ class="stat-value"
 <div>
 
 <div class="panel-title">
-مدیریت کانفیگ‌ها
+مدیریت کانفیگ‌هـا
 </div>
 
-<div class="panel-sub">
-VLESS / SUB / INFO
+<div class="panel-sub" style="display: flex; align-items: center; justify-content: center; gap: 6px; font-size: 0.75rem; color: rgba(255, 255, 255, 0.6); padding: 12px; text-align: center; direction: rtl;">
+  <span style="opacity: 0.8;">پشتیبانــی:</span>
+  <a href="https://t.me/logictop12" target="_blank" rel="noopener noreferrer" style="font-weight: 500; color: #34d399; text-decoration: none; transition: color 0.2s ease;" onmouseover="this.style.color='#6ee7b7'; this.style.textDecoration='underline';" onmouseout="this.style.color='#34d399'; this.style.textDecoration='none';">
+    @logictop12
+  </a>
 </div>
 
 </div>
@@ -6394,7 +6949,7 @@ VLESS / SUB / INFO
 class="top-btn primary"
 onclick="refresh()"
 >
-↻ بروزرسانی
+↻ بروزرسانـی
 </button>
 
 </div>
@@ -6407,28 +6962,29 @@ onclick="refresh()"
 
 <tr>
 
+<th>دسته</th>
 <th>
-نام
+نـام
 </th>
 
 <th>
-پروتکل
+پروتـکل
 </th>
 
 <th>
-وضعیت
+وضعیـت
 </th>
 
 <th>
-مصرف
+مصـرف
 </th>
 
 <th>
-زمان
+زمـان
 </th>
 
 <th>
-اتصال
+اتصـال
 </th>
 
 <th>
@@ -6436,7 +6992,7 @@ VLESS
 </th>
 
 <th>
-عملیات
+عملیـات
 </th>
 
 </tr>
@@ -6459,19 +7015,17 @@ VLESS
 <div class="panel-head">
 
 <div>
-<div class="panel-title">
-آخرین فعالیت‌ها
+<div class="panel-title">آخرین فعالیت‌ها</div>
+<div class="panel-sub">لاگ زنده سیستم · حداکثر ۱۵۰ رویداد</div>
 </div>
-</div>
+
+<button class="top-btn" onclick="refresh()" style="font-size:10px">↻ بروزرسانی</button>
 
 </div>
 
-<pre
-id="logs"
-class="pre"
->
-در حال بارگذاری...
-</pre>
+<div id="logs" style="padding:10px 12px;max-height:340px;overflow:auto">
+<div style="text-align:center;color:rgba(255,255,255,.3);padding:24px;font-size:11px">در حال بارگذاری...</div>
+</div>
 
 </div>
 
@@ -6482,7 +7036,7 @@ class="pre"
 
 <div>
 <div class="panel-title">
-دانلود برنامه اتصال
+دانلود برنامه اتصــال
 </div>
 
 <div class="panel-sub">
@@ -6608,16 +7162,16 @@ Windows
 <div class="notice">
 
 <strong>
-اطلاعیه مهم | آپدیت برنامه اتصال
+ مهـم | آپدیـت برنامـه اتصـال
 </strong>
 
 <br>
 
-دوستان عزیز ❤️
-برای اینکه کانفیگ‌های جدید بهترین
-سازگاری، پایداری و عملکرد رو داشته باشن،
-لطفاً برنامه‌ای که برای اتصال استفاده می‌کنید
-رو به آخرین نسخه آپدیت کنید. 🔄⚡️
+دوستان عزیـز ❤️
+برای اینکـه کانفیگ‌هـای جدیـد بهتریـن
+سازگـــاری، پایداری و عملکرد رو داشته باشن،
+لطفـاً برنامـه‌ای کــــــــه بـرای اتصـال استفـاده می‌کنیـد
+رو بــه آخرین نسخـــه آپدیــت کنیــد. 🔄⚡️
 
 </div>
 
@@ -6640,14 +7194,11 @@ class="modal-backdrop"
 <div class="modal-head">
 
 <div class="modal-title">
-ساخت کانفیگ دستی
+ساخـت کانفیـگ دستــی
 </div>
 
-<button
-class="close"
-onclick="closeManualModal()"
->
-×
+<button class="close" onclick="closeManualModal()" style="display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 50%; color: rgba(255, 255, 255, 0.7); font-size: 1.25rem; line-height: 1; cursor: pointer; transition: all 0.2s;" onmouseover="this.style.background='rgba(255, 255, 255, 0.1)'; this.style.color='#ffffff';" onmouseout="this.style.background='rgba(255, 255, 255, 0.05)'; this.style.color='rgba(255, 255, 255, 0.7)';">
+  ×
 </button>
 
 </div>
@@ -6657,50 +7208,66 @@ onclick="closeManualModal()"
 <div class="field">
 
 <label>
-نام کانفیگ
+اسـم کانفیـگ
 </label>
 
 <input
 id="manualName"
-placeholder="نام کانفیگ"
+placeholder="اسم کانفیگ"
 />
 
 </div>
 
 
-<div class="field">
-
-<label>
-پروتکل
-</label>
-
-<select id="manualProtocol">
-
-<option value="vless-ws">
-VLESS WebSocket
-</option>
-
-<option value="xhttp-packet-up">
-XHTTP Packet Up
-</option>
-
-<option value="xhttp-stream-up">
-XHTTP Stream Up
-</option>
-
-<option value="xhttp-stream-one">
-XHTTP Stream One
-</option>
-
-</select>
-
+<div class="field" style="margin-bottom: 16px;">
+  <label style="display: flex; align-items: center; justify-content: space-between; font-size: 0.875rem; color: #ffffff; margin-bottom: 6px;">
+    <span>پروتکــل (بتا)</span>
+    <span style="font-size: 0.75rem; color: #34d399; background-color: rgba(52, 211, 153, 0.1); padding: 2px 8px; border-radius: 9999px;">پیشنهادی: XHTTP Packet Up</span>
+  </label>
+  <select id="manualProtocol" style="width: 100%; background-color: #1f2937; color: #ffffff; padding: 10px 12px; border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px; font-size: 0.875rem; outline: none; cursor: pointer;">
+    <option value="vless-ws" style="background-color: #1f2937; color: #ffffff;">VLESS WebSocket</option>
+    <option value="xhttp-packet-up" style="background-color: #1f2937; color: #ffffff;">XHTTP Packet Up (پیشنهادی)</option>
+    <option value="xhttp-stream-up" style="background-color: #1f2937; color: #ffffff;">XHTTP Stream Up</option>
+    <option value="xhttp-stream-one" style="background-color: #1f2937; color: #ffffff;">XHTTP Stream One</option>
+    <option value="vmess-ws" style="background-color: #1f2937; color: #ffffff;">VMess WebSocket</option>
+    <option value="trojan-ws" style="background-color: #1f2937; color: #ffffff;">Trojan WebSocket</option>
+    <option value="shadowsocks" style="background-color: #1f2937; color: #ffffff;">Shadowsocks</option>
+    <option value="socks5" style="background-color: #1f2937; color: #ffffff;">SOCKS5</option>
+    <option value="http" style="background-color: #1f2937; color: #ffffff;">HTTP Proxy</option>
+    <option value="hysteria2" style="background-color: #1f2937; color: #ffffff;">Hysteria 2</option>
+    <option value="tuic" style="background-color: #1f2937; color: #ffffff;">TUIC</option>
+    <option value="highspeed-demo" style="background-color: #1f2937; color: #60a5fa;">HighSpeed Upload/Download (دمو)</option>
+    <option value="gaming-lite-demo" style="background-color: #1f2937; color: #60a5fa;">Gaming Lite (دمو)</option>
+  </select>
 </div>
 
+<div class="field">
+<label>دسته‌بندی</label>
+<select id="manualCategory" style="width:100%;background:#1f2937;color:#fff;padding:10px;border:1px solid rgba(255,255,255,.15);border-radius:8px">
+<option value="0">0 — عمومی</option>
+<option value="1">1 — VIP</option>
+</select>
+</div>
+<div class="field">
+<label>تعداد کانفیگ در ساب (۱-۴۰)</label>
+<input id="manualConfigCount" type="number" min="1" max="40" value="1" />
+</div>
+<div class="field full">
+<label>IP تمیز (اختیاری)</label>
+<textarea id="manualCleanIps" style="min-height:60px;direction:ltr" placeholder="1.2.3.4"></textarea>
+</div>
+<div class="field">
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer" onclick="toggleAlarmCheck()">
+<span id="alarmToggle" style="display:inline-flex;width:20px;height:20px;border-radius:5px;border:2px solid #6b7280;background:#374151;align-items:center;justify-content:center;color:transparent;font-size:12px">✓</span>
+<input type="checkbox" id="manualAlarm" style="display:none">
+آلارم انقضا/حجم
+</label>
+</div>
 
 <div class="field">
 
 <label>
-حجم
+حجـم
 </label>
 
 <input
@@ -6713,35 +7280,23 @@ placeholder="0 = نامحدود"
 </div>
 
 
-<div class="field">
-
-<label>
-واحد حجم
-</label>
-
-<select id="manualVolumeUnit">
-
-<option value="GB">
-GB
-</option>
-
-<option value="MB">
-MB
-</option>
-
-<option value="TB">
-TB
-</option>
-
-</select>
-
+<div class="field" style="margin-bottom: 16px;">
+  <label style="display: flex; align-items: center; justify-content: space-between; font-size: 0.875rem; color: #ffffff; margin-bottom: 6px;">
+    <span>واحد حجـم</span>
+    <span style="font-size: 0.75rem; color: #34d399; background-color: rgba(52, 211, 153, 0.1); padding: 2px 8px; border-radius: 9999px;">پیشنهادی: GB</span>
+  </label>
+  <select id="manualVolumeUnit" style="width: 100%; background-color: #1f2937; color: #ffffff; padding: 10px 12px; border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px; font-size: 0.875rem; outline: none; cursor: pointer;">
+    <option value="GB" style="background-color: #1f2937; color: #ffffff;">GB</option>
+    <option value="MB" style="background-color: #1f2937; color: #ffffff;">MB</option>
+    <option value="TB" style="background-color: #1f2937; color: #ffffff;">TB</option>
+  </select>
 </div>
 
 
 <div class="field">
 
 <label>
-تعداد روز
+تعـداد روز
 </label>
 
 <input
@@ -6757,7 +7312,7 @@ placeholder="0 = نامحدود"
 <div class="field">
 
 <label>
-محدودیت IP
+محدودیـت IP
 </label>
 
 <input
@@ -6773,7 +7328,7 @@ placeholder="0 = نامحدود"
 <div class="field">
 
 <label>
-محدودیت اتصال
+محدودیـت اتصـال
 </label>
 
 <input
@@ -6789,7 +7344,7 @@ placeholder="0 = نامحدود"
 <div class="field">
 
 <label>
-سرعت
+محدودیـت سرعـت
 </label>
 
 <input
@@ -6808,48 +7363,17 @@ placeholder="0 = نامحدود"
 Fingerprint
 </label>
 
-<select id="manualFingerprint">
-
-<option value="chrome">
-Chrome
-</option>
-
-<option value="firefox">
-Firefox
-</option>
-
-<option value="safari">
-Safari
-</option>
-
-<option value="ios">
-iOS
-</option>
-
-<option value="android">
-Android
-</option>
-
-<option value="edge">
-Edge
-</option>
-
-<option value="360">
-360
-</option>
-
-<option value="qq">
-QQ
-</option>
-
-<option value="random">
-Random
-</option>
-
-<option value="randomized">
-Randomized
-</option>
-
+<select id="manualFingerprint" style="width: 100%; background-color: #1f2937; color: #ffffff; padding: 10px 12px; border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px; font-size: 0.875rem; outline: none; cursor: pointer;">
+  <option value="chrome" style="background-color: #1f2937; color: #ffffff;">Chrome</option>
+  <option value="firefox" style="background-color: #1f2937; color: #ffffff;">Firefox</option>
+  <option value="safari" style="background-color: #1f2937; color: #ffffff;">Safari</option>
+  <option value="ios" style="background-color: #1f2937; color: #ffffff;">iOS</option>
+  <option value="android" style="background-color: #1f2937; color: #ffffff;">Android</option>
+  <option value="edge" style="background-color: #1f2937; color: #ffffff;">Edge</option>
+  <option value="360" style="background-color: #1f2937; color: #ffffff;">360</option>
+  <option value="qq" style="background-color: #1f2937; color: #ffffff;">QQ</option>
+  <option value="random" style="background-color: #1f2937; color: #ffffff;">Random</option>
+  <option value="randomized" style="background-color: #1f2937; color: #ffffff;">Randomized</option>
 </select>
 
 </div>
@@ -6857,28 +7381,16 @@ Randomized
 
 <div class="field">
 
-<label>
-Fragment
+<label style="display: flex; align-items: center; justify-content: space-between; font-size: 0.875rem; color: #ffffff; margin-bottom: 6px;">
+  <span>Fragment</span>
+  <span style="font-size: 0.75rem; color: #34d399; background-color: rgba(52, 211, 153, 0.1); padding: 2px 8px; border-radius: 9999px;">پیشنهادی: خاموش</span>
 </label>
 
-<select id="manualFragment">
-
-<option value="off">
-خاموش
-</option>
-
-<option value="safe">
-Safe
-</option>
-
-<option value="balanced">
-Balanced
-</option>
-
-<option value="aggressive">
-Aggressive
-</option>
-
+<select id="manualFragment" style="background-color: #1f2937; color: #ffffff; padding: 8px 12px; border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px; font-size: 0.875rem; outline: none; cursor: pointer;">
+  <option value="off" style="background-color: #1f2937; color: #ffffff;">خاموش</option>
+  <option value="safe" style="background-color: #1f2937; color: #ffffff;">Safe</option>
+  <option value="balanced" style="background-color: #1f2937; color: #ffffff;">Balanced</option>
+  <option value="aggressive" style="background-color: #1f2937; color: #ffffff;">Aggressive</option>
 </select>
 
 </div>
@@ -6918,7 +7430,7 @@ value="http/1.1"
 <div class="field full">
 
 <label>
-یادداشت
+یادداشــت
 </label>
 
 <textarea
@@ -6952,98 +7464,237 @@ onclick="createManual()"
 
 </div>
 
+<!-- ===================================================== -->
+
+<!-- AUTO MODAL -->
 
 <!-- ===================================================== -->
-<!-- AUTO MODAL -->
-<!-- ===================================================== -->
+
+
 
 <div
+
 id="autoModal"
+
 class="modal-backdrop"
+
 >
+
+
 
 <div class="modal">
 
+
+
 <div class="modal-head">
 
+
+
 <div class="modal-title">
-ساخت خودکار
+
+ساخـت خودکــار
+
 </div>
 
-<button
-class="close"
-onclick="closeAutoModal()"
->
-×
+
+
+<button class="close" onclick="closeAutoModal()" style="display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 50%; color: rgba(255, 255, 255, 0.7); font-size: 1.25rem; line-height: 1; cursor: pointer; transition: all 0.2s;" onmouseover="this.style.background='rgba(255, 255, 255, 0.1)'; this.style.color='#ffffff';" onmouseout="this.style.background='rgba(255, 255, 255, 0.05)'; this.style.color='rgba(255, 255, 255, 0.7)';">
+  ×
 </button>
 
+
+
 </div>
+
+
+
+<div class="form-grid" style="margin-top:14px">
+<div class="field"><label>دسته‌بندی</label>
+<select id="autoCategory" style="width:100%;background:#1f2937;color:#fff;padding:10px;border:1px solid rgba(255,255,255,.15);border-radius:8px">
+<option value="0">0 — عمومی</option><option value="1">1 — VIP</option>
+</select></div>
+<div class="field"><label>تعداد کانفیگ (۱-۴۰)</label>
+<input id="autoConfigCount" type="number" min="1" max="40" value="1" /></div>
+<div class="field">
+
+<label>پروتکـل</label>
+
+<select id="autoProtocol" style="width: 100%; background-color: #1f2937; color: #ffffff; padding: 10px 12px; border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px; font-size: 0.875rem; outline: none; cursor: pointer;">
+  <option value="vless-ws" style="background-color: #1f2937; color: #ffffff;">VLESS WebSocket</option>
+  <option value="xhttp-packet-up" style="background-color: #1f2937; color: #ffffff;">XHTTP Packet Up</option>
+  <option value="xhttp-stream-up" style="background-color: #1f2937; color: #ffffff;">XHTTP Stream Up</option>
+  <option value="xhttp-stream-one" style="background-color: #1f2937; color: #ffffff;">XHTTP Stream One</option>
+  <option value="vmess-ws" style="background-color: #1f2937; color: #ffffff;">VMess WebSocket</option>
+  <option value="trojan-ws" style="background-color: #1f2937; color: #ffffff;">Trojan WebSocket</option>
+  <option value="shadowsocks" style="background-color: #1f2937; color: #ffffff;">Shadowsocks</option>
+  <option value="socks5" style="background-color: #1f2937; color: #ffffff;">SOCKS5</option>
+  <option value="http" style="background-color: #1f2937; color: #ffffff;">HTTP Proxy</option>
+  <option value="hysteria2" style="background-color: #1f2937; color: #ffffff;">Hysteria 2</option>
+  <option value="tuic" style="background-color: #1f2937; color: #ffffff;">TUIC</option>
+  <option value="highspeed-demo" style="background-color: #1f2937; color: #60a5fa;">HighSpeed Upload/Download (دمو)</option>
+  <option value="gaming-lite-demo" style="background-color: #1f2937; color: #60a5fa;">Gaming Lite (دمو)</option>
+  <option value="xhttp-packet-up" style="background-color: #1f2937; color: #60a5fa;">XHTTP Packet Up</option>
+  <option value="xhttp-stream-up" style="background-color: #1f2937; color: #60a5fa;">XHTTP Stream Up</option>
+</select>
+
+</div>
+
+<div class="field" style="margin-bottom: 16px;">
+
+  <label style="display: flex; align-items: center; justify-content: space-between; font-size: 0.875rem; color: #ffffff; margin-bottom: 6px;">
+
+    <span>پروفایـل امنیتـی</span>
+
+    <span style="font-size: 0.75rem; color: #34d399; background-color: rgba(52, 211, 153, 0.1); padding: 2px 8px; border-radius: 9999px;">پیشنهادی: Maximum</span>
+
+  </label>
+
+  <select id="autoProfile" style="width: 100%; background-color: #1f2937; color: #ffffff; padding: 10px 12px; border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px; font-size: 0.875rem; outline: none; cursor: pointer;">
+
+    <option value="balanced" style="background-color: #1f2937; color: #ffffff;">Balanced</option>
+
+    <option value="gaming" style="background-color: #1f2937; color: #ffffff;">Gaming</option>
+
+    <option value="maximum" style="background-color: #1f2937; color: #ffffff;">Maximum</option>
+
+    <option value="normal" style="background-color: #1f2937; color: #ffffff;">Normal</option>
+
+  </select>
+
+</div>
+
+</div>
+
+
 
 <div
-style="
-color:rgba(255,255,255,.55);
-font-size:11px;
-line-height:2;
-"
->
 
-کانفیگ خودکار با نام تصادفی
+style="
+
+color:rgba(255,255,255,.55);
+
+font-size:11px;
+
+line-height:2;
+
+">
+
+
+
+اسم کانفیگ ها کاملا رندوم
+
 <code>pxpanel_********</code>
+
 ساخته می‌شود.
 
-<br>
 
-حجم: <b>نامحدود</b>
 
 <br>
 
-زمان: <b>نامحدود</b>
+
+
+حجـم: <b>نامحدود</b>
+
+
 
 <br>
 
-IP: <b>نامحدود</b>
+
+
+زمـان: <b>نامحدود</b>
+
+
 
 <br>
 
-سرعت: <b>نامحدود</b>
+
+
+محدودیـت ایپـی: <b>نامحدود</b>
+
+
 
 <br>
 
-اتصال: <b>نامحدود</b>
+
+
+محدودیـت سرعـت: <b>نامحدود</b>
+
+
 
 <br>
 
-پروتکل:
+
+
+محدودیـت اتصال همزمـان: <b>نامحدود</b>
+
+
+
+<br>
+
+
+
+پروتکـل:
+
 <b>VLESS WebSocket</b>
 
+
+
 <br>
 
-Port:
+
+
+پورت:
+
 <b>443</b>
 
+
+
 </div>
+
+
 
 <div class="modal-actions">
 
+
+
 <button
+
 class="modal-btn secondary"
+
 onclick="closeAutoModal()"
+
 >
-انصراف
+
+لغو
+
 </button>
+
+
 
 <button
+
 class="modal-btn primary"
+
 onclick="createAuto()"
+
 >
-ساخت خودکار
+
+ساخت
+
 </button>
 
-</div>
+
 
 </div>
 
+
+
 </div>
+
+
+
+</div>
+
 
 
 <!-- ===================================================== -->
@@ -7060,14 +7711,11 @@ class="modal-backdrop"
 <div class="modal-head">
 
 <div class="modal-title">
-تغییر رمز پنل
+تغییر رمز پنـل
 </div>
 
-<button
-class="close"
-onclick="closePasswordModal()"
->
-×
+<button class="close" onclick="closePasswordModal()" style="display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 50%; color: rgba(255, 255, 255, 0.7); font-size: 1.25rem; line-height: 1; cursor: pointer; transition: all 0.2s;" onmouseover="this.style.background='rgba(255, 255, 255, 0.1)'; this.style.color='#ffffff';" onmouseout="this.style.background='rgba(255, 255, 255, 0.05)'; this.style.color='rgba(255, 255, 255, 0.7)';">
+  ×
 </button>
 
 </div>
@@ -7077,7 +7725,7 @@ onclick="closePasswordModal()"
 <div class="field full">
 
 <label>
-رمز فعلی
+رمز فعلـی
 </label>
 
 <input
@@ -7090,7 +7738,7 @@ type="password"
 <div class="field">
 
 <label>
-رمز جدید
+رمز جدیـد
 </label>
 
 <input
@@ -7103,7 +7751,7 @@ type="password"
 <div class="field">
 
 <label>
-تکرار رمز جدید
+تکرار رمز جدیـد
 </label>
 
 <input
@@ -7121,14 +7769,14 @@ type="password"
 class="modal-btn secondary"
 onclick="closePasswordModal()"
 >
-انصراف
+لغو
 </button>
 
 <button
 class="modal-btn primary"
 onclick="changePassword()"
 >
-ذخیره رمز
+ذخیره رمـز عبور
 </button>
 
 </div>
@@ -7140,36 +7788,99 @@ onclick="changePassword()"
 
     <!-- LOGIN NOTICE START -->
 <div id="loginNoticeModal" class="login-notice-backdrop" role="dialog" aria-modal="true" aria-labelledby="regionNoticeTitle">
-<div class="login-notice">
-<div class="login-notice-head">
-<div class="login-notice-icon">
-<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M12 7v5l3 2"/><path d="M16.5 3.5h4v4"/><path d="m20.5 3.5-5 5"/></svg>
+  <div class="login-notice">
+    <div class="login-notice-head">
+      <div class="login-notice-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+          <path d="M12 3a9 9 0 1 0 9 9"/>
+          <path d="M12 7v5l3 2"/>
+          <path d="M16.5 3.5h4v4"/>
+          <path d="m20.5 3.5-5 5"/>
+        </svg>
+      </div>
+      <div>
+        <h3 id="regionNoticeTitle">راهنمای اتصال سرویس</h3>
+        <p>اطلاعیه مهم منطقه‌ای پیش از اتصال کانفیگ‌ها</p>
+      </div>
+    </div>
+    <div class="login-notice-body">
+      <p><b>نکته:</b> برای استفاده، لینک اشتراک (SUB) را در برنامه وارد (Import / Subscription) کرده یا از لینک مستقیم VLESS استفاده کنید.</p>
+      <div class="region-warning" role="alert">
+        <div class="warning-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
+            <path d="m12 3 9 17H3L12 3Z"/>
+            <path d="M12 9v5"/>
+            <path d="M12 17h.01"/>
+          </svg>
+          هشدار منطقه‌ای اتصال
+        </div>
+        <p>در صورتی که پنل با موفقیت نصب شد اما کانفیگ‌ها پینگ نداشتند، دامنه مسدود شده است؛ لطفاً دامنه جدیدی بسازید.</p>
+      </div>
+    </div>
+    <div class="notice-downloads">
+      <a class="notice-download" href="https://github.com/2dust/v2rayNG/releases/latest" target="_blank" rel="noopener noreferrer">
+        <strong>v2rayNG</strong>
+        <span>اندروید</span>
+      </a>
+      <a class="notice-download" href="https://github.com/2dust/v2rayN/releases/latest" target="_blank" rel="noopener noreferrer">
+        <strong>v2rayN</strong>
+        <span>ویندوز / مک / لینوکس</span>
+      </a>
+      <a class="notice-download" href="https://github.com/hiddify/hiddify-app/releases/latest" target="_blank" rel="noopener noreferrer">
+        <strong>Hiddify</strong>
+        <span>چندپلتفرمی</span>
+      </a>
+    </div>
+    <div class="login-notice-actions">
+      <button type="button" onclick="closeLoginNotice()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <path d="m5 12 4 4L19 6"/>
+        </svg>
+        متوجه شدم
+      </button>
+    </div>
+  </div>
 </div>
-<div>
-<h3 id="regionNoticeTitle">راهنمای اتصال سرویس</h3>
-<p>اطلاعیه مهم منطقه‌ای قبل از اتصال کانفیگ‌ها</p>
-</div>
-</div>
-<div class="login-notice-body">
-<b>نکته:</b> لینک SUB را داخل برنامه Import / Subscription اضافه کنید. برای اتصال مستقیم نیز می‌توانید لینک VLESS را وارد کنید.
-<div class="region-warning">
-<div class="warning-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="m12 3 9 17H3L12 3Z"/><path d="M12 9v5"/><path d="M12 17h.01"/></svg>هشدار منطقه‌ای اتصال</div>
-⚠️⚠️ اگه براتون پنل نصب شد ولی کانفیگ ها پینگ ندادن — دامنه فیلتر شده — دوباره بسازید ⚠️⚠️
-</div>
-</div>
-<div class="notice-downloads">
-<a class="notice-download" href="https://github.com/2dust/v2rayNG/releases/latest" target="_blank" rel="noopener noreferrer"><strong>v2rayNG</strong><span>Android</span></a>
-<a class="notice-download" href="https://github.com/2dust/v2rayN/releases/latest" target="_blank" rel="noopener noreferrer"><strong>v2rayN</strong><span>Windows / macOS / Linux</span></a>
-<a class="notice-download" href="https://github.com/hiddify/hiddify-app/releases/latest" target="_blank" rel="noopener noreferrer"><strong>Hiddify</strong><span>Android / Windows / macOS / Linux</span></a>
-</div>
-<div class="login-notice-actions"><button type="button" onclick="closeLoginNotice()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m5 12 4 4L19 6"/></svg>متوجه شدم</button></div>
-</div></div>
-    <!-- LOGIN NOTICE END -->
+<!-- LOGIN NOTICE END -->
 
-<div
-id="toast"
-class="toast"
-></div>
+<div id="mixModal" class="modal-backdrop">
+<div class="modal" style="max-width:640px">
+<div class="modal-head"><div class="modal-title">مخلوط‌سازی کانفیگ‌ها</div>
+<button class="close" onclick="closeMixModal()">×</button></div>
+<p style="color:rgba(255,255,255,.55);font-size:11px;line-height:1.9;margin:0 0 12px">
+چند کانفیگ از لیست «مدیریت کانفیگ‌ها» را انتخاب کنید تا داخل یک ساب واحد ترکیب شوند.
+حداقل ۲ و حداکثر ۴۰ کانفیگ. بعد از ساخت، لینک ساب مخلوط در اختیار شماست.
+</p>
+<div id="mixList" style="max-height:280px;overflow:auto;margin-bottom:12px"></div>
+<div class="modal-actions">
+<button class="modal-btn secondary" onclick="closeMixModal()">بستن</button>
+<button class="modal-btn primary" style="background:linear-gradient(135deg,#dc2626,#ef4444)" onclick="doMixConfigs()">ساخت ساب مخلوط</button>
+</div></div></div>
+
+<div id="categoryModal" class="modal-backdrop">
+<div class="modal" style="max-width:620px">
+<div class="modal-head"><div class="modal-title">دسته‌بندی‌ها</div>
+<button class="close" onclick="closeCategoryModal()">×</button></div>
+<div id="categoryList" style="font-size:11px;margin-bottom:12px"></div>
+<div class="form-grid">
+<div class="field full"><label>نام</label><input id="catName" placeholder="نام دسته‌بندی" /></div>
+<div class="field"><label>حجم</label><input id="catVolume" type="number" min="0" placeholder="0 = نامحدود" /></div>
+<div class="field"><label>واحد</label><select id="catVolumeUnit"><option value="GB">GB</option><option value="MB">MB</option><option value="TB">TB</option></select></div>
+<div class="field"><label>روز</label><input id="catDays" type="number" min="0" placeholder="0 = نامحدود" /></div>
+<div class="field"><label>IP Limit</label><input id="catIp" type="number" min="0" placeholder="0 = نامحدود" /></div>
+<div class="field"><label>اتصال</label><input id="catConn" type="number" min="0" placeholder="0 = نامحدود" /></div>
+<div class="field"><label>سرعت Mbit</label><input id="catSpeed" type="number" min="0" placeholder="0 = نامحدود" /></div>
+<div class="field full"><label>IP تمیز</label><textarea id="catClean" style="min-height:48px;direction:ltr" placeholder="اختیاری"></textarea></div>
+<div class="field"><label><input type="checkbox" id="catRandom"> اسم تصادفی</label></div>
+<div class="field"><label><input type="checkbox" id="catSingle"> تک‌کاربره</label></div>
+<input type="hidden" id="catEditId" value="" />
+</div>
+<div class="modal-actions">
+<button class="modal-btn secondary" onclick="closeCategoryModal()">بستن</button>
+<button class="modal-btn primary" onclick="createCategory()">ساخت</button>
+</div></div></div>
+
+<div id="toast" class="toast"></div>
 
 
 <script>
@@ -7399,8 +8110,13 @@ async function refresh(){
         await Promise.all([
             api("/stats"),
             api("/api/links"),
-            api("/api/activity")
+            api("/api/activity"),
+            api("/api/categories")
         ]);
+    if(results[3]&&results[3].categories){
+      var opts=results[3].categories.map(function(cat){return "<option value='"+cat.id+"'>"+cat.number+" — "+escapeHtml(cat.name)+"</option>";}).join("");
+      ["manualCategory","autoCategory"].forEach(function(id){var s=document.getElementById(id);if(s){var v=s.value;s.innerHTML=opts;if(v)s.value=v;}});
+    }
 
     const statsData =
         results[0];
@@ -7465,7 +8181,7 @@ async function refresh(){
             table.innerHTML = `
                 <tr>
                     <td
-                    colspan="8"
+                    colspan="9"
                     class="empty"
                     >
                     هنوز کانفیگی ساخته نشده است.
@@ -7519,6 +8235,7 @@ async function refresh(){
 
                 row.innerHTML = `
 
+<td style="text-align:center;font-weight:800;color:#60a5fa">${link.category_number != null ? link.category_number : 0}</td>
 <td>
 
 <div style="font-weight:700">
@@ -7550,24 +8267,8 @@ ${escapeHtml(
 
 
 <td>
-
-<span class="
-    badge
-    ${
-        link.active
-        ? "active"
-        : "off"
-    }
-">
-
-${
-    link.active
-    ? "فعال"
-    : "غیرفعال"
-}
-
-</span>
-
+<span style="display:inline-block;width:10px;height:10px;border-radius:50%;margin-left:5px;background:${link.status_color==='green'?'#22c55e':(link.status_color==='red'?'#ef4444':'#6b7280')}"></span>
+<span class="badge ${link.active ? 'active' : 'off'}">${link.active ? 'فعال' : 'غیرفعال'}</span>
 </td>
 
 
@@ -7608,13 +8309,7 @@ ${escapeHtml(link.vless)}
 
 <div class="actions">
 
-<button
-class="action primary"
-type="button"
-data-action="copy-vless"
->
-VLESS
-</button>
+${link.show_vless !== false && link.vless ? '<button class="action primary" type="button" data-action="copy-vless">VLESS</button>' : ''}
 
 <button
 class="action"
@@ -7732,28 +8427,49 @@ data-action="delete"
     }
 
 
-    if(
-        activity
-        &&
-        activity.logs
-    ){
-
-        document.getElementById(
-            "logs"
-        ).textContent =
-            activity.logs
-                .slice()
-                .reverse()
-                .map(
-                    item =>
-                        `[${item.level}] ${item.message}`
-                )
-                .join(
-                    "\n"
-                )
-                ||
-                "فعالیتی ثبت نشده است";
-
+    if(activity && activity.logs){
+        var box = document.getElementById("logs");
+        if(box){
+            var items = activity.logs.slice().reverse();
+            if(!items.length){
+                box.innerHTML = "<div style='text-align:center;color:rgba(255,255,255,.3);padding:24px;font-size:11px'>فعالیتی ثبت نشده است</div>";
+            } else {
+                var html = "";
+                items.forEach(function(item){
+                    var level = (item.level || "info").toLowerCase();
+                    var color = "#60a5fa";
+                    var bg = "rgba(37,99,235,.08)";
+                    var border = "rgba(96,165,250,.18)";
+                    var icon = "ℹ";
+                    if(level === "ok" || level === "success"){
+                        color = "#4ade80"; bg = "rgba(34,197,94,.08)"; border = "rgba(74,222,128,.2)"; icon = "✓";
+                    } else if(level === "err" || level === "error"){
+                        color = "#f87171"; bg = "rgba(239,68,68,.08)"; border = "rgba(248,113,113,.2)"; icon = "!";
+                    } else if(level === "warn" || level === "warning"){
+                        color = "#fbbf24"; bg = "rgba(245,158,11,.08)"; border = "rgba(251,191,36,.2)"; icon = "⚠";
+                    }
+                    var t = item.time || "";
+                    try {
+                        if(t){
+                            var d = new Date(t);
+                            if(!isNaN(d.getTime())){
+                                t = d.toLocaleString("fa-IR", {hour:"2-digit", minute:"2-digit", second:"2-digit", day:"2-digit", month:"2-digit"});
+                            }
+                        }
+                    } catch(e){}
+                    var kind = item.kind ? ("<span style='opacity:.55;margin-left:6px'>· " + escapeHtml(item.kind) + "</span>") : "";
+                    html += "<div style='display:flex;gap:10px;align-items:flex-start;padding:10px 12px;margin-bottom:6px;border-radius:12px;background:" + bg + ";border:1px solid " + border + "'>";
+                    html += "<div style='flex:0 0 28px;width:28px;height:28px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:900;color:" + color + ";background:rgba(0,0,0,.2);border:1px solid " + border + "'>" + icon + "</div>";
+                    html += "<div style='flex:1;min-width:0'>";
+                    html += "<div style='font-size:11px;font-weight:600;color:rgba(255,255,255,.88);line-height:1.7'>" + escapeHtml(item.message || "") + "</div>";
+                    html += "<div style='margin-top:3px;font-size:9px;color:rgba(255,255,255,.35);display:flex;gap:8px;flex-wrap:wrap'>";
+                    html += "<span style='color:" + color + ";font-weight:700'>" + escapeHtml(level.toUpperCase()) + "</span>" + kind;
+                    if(t) html += "<span style='margin-right:auto;direction:ltr'>" + escapeHtml(t) + "</span>";
+                    html += "</div></div></div>";
+                });
+                box.innerHTML = html;
+            }
+        }
     }
 
 }
@@ -7891,39 +8607,22 @@ function closePasswordModal(){
 
 
 async function createAuto(){
-
+    const protocol = document.getElementById("autoProtocol")?.value || "vless-ws";
+    const profile = document.getElementById("autoProfile")?.value || "balanced";
+    const category_id = (document.getElementById("autoCategory")||{}).value || "0";
+    const config_count = Number((document.getElementById("autoConfigCount")||{}).value || 1);
     closeAutoModal();
-
-    showToast(
-        "در حال ساخت کانفیگ..."
-    );
-
-    const result =
-        await api(
-            "/api/links/auto",
-            {
-                method:"POST"
-            }
-        );
-
-    if(
-        !result
-        ||
-        !result.ok
-    ){
-        return;
-    }
-
-    await copyText(
-        result.vless
-    );
-
-    showToast(
-        "کانفیگ ساخته شد و VLESS کپی شد"
-    );
-
+    showToast("در حال ساخت کانفیگ حرفه‌ای...");
+    const result = await api("/api/links", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({protocol, profile, category_id, config_count, label:"", limit_value:0, expires_days:0})
+    });
+    if(!result || !result.ok) return;
+    const config = result.config || result.vless || result.link || "";
+    await copyText(config);
+    showToast("کانفیگ ساخته شد و در کلیپ‌بورد قرار گرفت");
     await refresh();
-
 }
 
 
@@ -8044,7 +8743,11 @@ async function createManual(){
                 .getElementById(
                     "manualNote"
                 )
-                .value
+                .value,
+        clean_ips: (document.getElementById("manualCleanIps")||{}).value || "",
+        alarm_enabled: !!(document.getElementById("manualAlarm")||{}).checked,
+        category_id: (document.getElementById("manualCategory")||{}).value || "0",
+        config_count: Number((document.getElementById("manualConfigCount")||{}).value || 1)
 
     };
 
@@ -8270,12 +8973,115 @@ async function changePassword(){
 }
 
 
-refresh();
+function openMixModal(){
+  var list=document.getElementById("mixList");
+  if(!list)return;
+  api("/api/links").then(function(data){
+    if(!data||!data.links){list.innerHTML="<div class='empty'>کانفیگی نیست</div>";return;}
+    var html="";
+    data.links.forEach(function(link){
+      if(!link.active)return;
+      html+="<label style='display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:10px;background:rgba(255,255,255,.03);margin-bottom:5px;cursor:pointer'>";
+      html+="<input type='checkbox' class='mix-check' value='"+link.uuid+"' style='width:16px;height:16px'>";
+      html+="<span style='flex:1'><b>"+escapeHtml(link.label)+"</b> <span style='color:rgba(255,255,255,.35);font-size:9px'>"+escapeHtml(link.protocol||"")+"</span></span>";
+      html+="<span style='color:#60a5fa;font-size:10px'>دسته "+(link.category_number!=null?link.category_number:0)+"</span>";
+      html+="</label>";
+    });
+    list.innerHTML=html||"<div class='empty'>کانفیگ فعالی نیست</div>";
+  });
+  document.getElementById("mixModal").classList.add("open");
+}
+function closeMixModal(){document.getElementById("mixModal").classList.remove("open");}
+async function doMixConfigs(){
+  var ids=[];
+  document.querySelectorAll(".mix-check:checked").forEach(function(el){ids.push(el.value);});
+  if(ids.length<2){showToast("حداقل ۲ کانفیگ انتخاب کنید");return;}
+  var res=await api("/api/mix-sub",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({link_ids:ids})});
+  if(res&&res.ok){
+    showToast("ساب مخلوط ساخته شد ("+res.count+")");
+    if(res.sub_url){await copyText(res.sub_url);showToast("لینک ساب کپی شد");}
+    closeMixModal();
+  }
+}
 
-setInterval(
-    refresh,
-    1000
-);
+function toggleAlarmCheck(){
+  var cb=document.getElementById("manualAlarm");
+  var box=document.getElementById("alarmToggle");
+  if(!cb||!box)return;
+  cb.checked=!cb.checked;
+  if(cb.checked){box.style.background="#22c55e";box.style.borderColor="#22c55e";box.style.color="#fff";}
+  else{box.style.background="#374151";box.style.borderColor="#6b7280";box.style.color="transparent";}
+}
+function openCategoryModal(){loadCategoriesUI();document.getElementById("categoryModal").classList.add("open");}
+function closeCategoryModal(){document.getElementById("categoryModal").classList.remove("open");}
+async function loadCategoriesUI(){
+  var data=await api("/api/categories");
+  if(!data||!data.categories)return;
+  window.__cats = data.categories;
+  var list=document.getElementById("categoryList");
+  var html=""; var opts="";
+  data.categories.forEach(function(cat){
+    opts+="<option value='"+cat.id+"'>"+cat.number+" — "+escapeHtml(cat.name)+"</option>";
+    html+="<div style='display:flex;justify-content:space-between;align-items:center;padding:8px;border-radius:10px;background:rgba(255,255,255,.03);margin-bottom:5px;gap:8px'><span><b style='color:#60a5fa'>"+cat.number+"</b> — "+escapeHtml(cat.name);
+    if(cat.single_user) html+=" <span style='color:#fbbf24;font-size:9px'>تک‌کاربره</span>";
+    html+="</span><span style='display:flex;gap:4px'>";
+    html+="<button class='action' type='button' onclick=\"editCategory('"+cat.id+"')\">ویرایش</button>";
+    if(cat.id!=="0"&&cat.id!=="1") html+="<button class='action danger' type='button' onclick=\"deleteCategory('"+cat.id+"')\">حذف</button>";
+    html+="</span></div>";
+  });
+  if(list) list.innerHTML=html;
+  ["manualCategory","autoCategory"].forEach(function(id){var s=document.getElementById(id);if(s){var v=s.value;s.innerHTML=opts;if(v)s.value=v;}});
+}
+function editCategory(id){
+  var cat=(window.__cats||[]).find(function(x){return x.id===id});
+  if(!cat)return;
+  document.getElementById("catEditId").value=id;
+  document.getElementById("catName").value=cat.name||"";
+  document.getElementById("catVolume").value="";
+  document.getElementById("catDays").value=cat.expires_days||0;
+  document.getElementById("catIp").value=cat.ip_limit||0;
+  document.getElementById("catConn").value=cat.connection_limit||0;
+  document.getElementById("catSpeed").value="";
+  document.getElementById("catClean").value=(cat.clean_ips||[]).join("\n");
+  document.getElementById("catRandom").checked=!!cat.random_name;
+  document.getElementById("catSingle").checked=!!cat.single_user;
+  showToast("در حال ویرایش: "+cat.name);
+}
+
+async function createCategory(){
+  var body={name:(document.getElementById("catName").value||"").trim()||"دسته جدید",
+    limit_value:Number(document.getElementById("catVolume").value||0),
+    limit_unit:document.getElementById("catVolumeUnit").value,
+    expires_days:Number(document.getElementById("catDays").value||0),
+    ip_limit:Number(document.getElementById("catIp").value||0),
+    connection_limit:Number(document.getElementById("catConn").value||0),
+    speed_limit_value:Number(document.getElementById("catSpeed").value||0),
+    clean_ips:(document.getElementById("catClean").value||"").trim(),
+    random_name:!!document.getElementById("catRandom").checked,
+    single_user:!!document.getElementById("catSingle").checked};
+  var editId=(document.getElementById("catEditId")||{}).value||"";
+  var res;
+  if(editId){
+    res=await api("/api/categories/"+encodeURIComponent(editId),{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  } else {
+    res=await api("/api/categories",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  }
+  if(res&&res.ok){
+    showToast(editId?"ویرایش شد":"ساخته شد");
+    document.getElementById("catName").value="";
+    document.getElementById("catEditId").value="";
+    await loadCategoriesUI();
+  }
+}
+async function deleteCategory(id){
+  if(!confirm("حذف؟"))return;
+  var res=await api("/api/categories/"+encodeURIComponent(id),{method:"DELETE"});
+  if(res&&res.ok){showToast("حذف شد");await loadCategoriesUI();}
+}
+
+refresh();
+setInterval(refresh, 3000);
+
 
 </script>
 
@@ -8348,8 +9154,8 @@ setInterval(
             </div>
 
             <div style="min-width:0;flex:1;">
-                <div style="font-size:18px;font-weight:900;color:#fff;line-height:1.5;">هشدار مهم قبل ساخت کانفیگ</div>
-                <div style="margin-top:5px;font-size:11px;color:rgba(255,255,255,.45);">بررسی دامنه و محدودیت‌های منطقه‌ای</div>
+                <div style="font-size:18px;font-weight:900;color:#fff;line-height:1.5;">به بهترین نسخه PX Panel خوش اومدید عشقا 💙</div>
+                <div style="margin-top:5px;font-size:11px;color:rgba(255,255,255,.45);">کانال تلگرام: LogicSec</div>
             </div>
 
             <button
@@ -8390,9 +9196,14 @@ setInterval(
                 text-align:right;
             "
         >
-            <strong style="color:#fbbf24;">⚠️⚠️</strong> اگه براتون پنل نصب شد ولی کانفیگ ها پینگ ندادن — دامنه فیلتر شده — دوباره بسازید <strong style="color:#fbbf24;">⚠️⚠️</strong>
-            <div style="margin-top:10px;color:rgba(255,255,255,.48);font-size:11px;line-height:1.9;">
-                ممکنه دسترسی دامنه به‌دلیل محدودیت‌های منطقه‌ای، اپراتور یا ISP متفاوت باشه. در این شرایط یک دامنه جدید امتحان کنید.
+            <div style="color:rgba(255,255,255,.85);font-size:13px;line-height:2;margin-bottom:10px;">
+              به <b style="color:#60a5fa;">PX Panel</b> خوش آمدید. پنل آماده مدیریت کانفیگ‌ها، دسته‌بندی و سابسکریپشن است.
+            </div>
+            <div style="margin-top:8px;padding:12px;border-radius:12px;background:rgba(37,99,235,.1);border:1px solid rgba(96,165,250,.2);color:#93c5fd;font-size:12px;">
+              کانال تلگرام: <b>LogicSec</b>
+            </div>
+            <div style="margin-top:12px;color:rgba(255,255,255,.5);font-size:11px;line-height:1.9;">
+              اگر کانفیگ‌ها پینگ ندادند، دامنه ممکن است فیلتر شده باشد — دامنه جدید بسازید.
             </div>
         </div>
 
@@ -8465,6 +9276,7 @@ async def dashboard(
             "/login"
         )
 
+    await ensure_default_categories()
     await ensure_default_link()
 
     return HTMLResponse(
@@ -8555,7 +9367,7 @@ async def global_exception_handler(
             padding:40px;
         ">
             <h2>
-            خطای داخلی PXpanel
+            خطای داخلی PX Panel
             </h2>
 
             <p>
